@@ -197,6 +197,25 @@ public:
         QStringList log_value;
 
         QStringList log_value_enabled;
+        QStringList log_value_storagetype;      // "", uint8, uint16, uint32, int8, int16, int32, float
+        QStringList log_value_endian;           // "big" (default) or "little"
+
+        // Number of standard <parameter> entries; extended entries are appended after this index
+        int std_log_value_count = -1;
+
+        // Extended parameters (<ecuparam>) from RomRaider logger definition.
+        // One entry per <ecu> block, resolved against connected ECU ID at init.
+        QStringList ext_protocol;
+        QStringList ext_id;
+        QStringList ext_name;
+        QStringList ext_description;
+        QStringList ext_target;
+        QStringList ext_ecu_ids;                // comma separated ECU ID list
+        QStringList ext_address;
+        QStringList ext_length;
+        QStringList ext_units;
+        QStringList ext_storagetype;
+        QStringList ext_endian;
 
         QStringList log_values_names_sorted;
         QStringList log_values_by_protocol;
@@ -470,6 +489,12 @@ public:
      * Read logger def file
      ***********************/
     LogValuesStructure *read_logger_definition_file();
+
+    /*****************************************************
+     * Add extended (ecuparam) log values matching ECU ID
+     * Returns number of extended values added
+     *****************************************************/
+    int add_extended_log_values(LogValuesStructure *logValues, QString ecu_id);
 
     /*************************
      * Read logger conf file

@@ -1,6 +1,626 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 #include "serial_port_actions.h"
+#include <cmath>
+#include <cstring>
+
+// ===== R36S: correct math for logged values =====
+// FastECU's expression evaluator groups * and / from the right, so an
+// expression like "x/128*14.7" (A/F Sensor) was computed as x/(128*14.7)
+// and showed ~0.07 instead of ~14.7. This evaluator uses normal math rules
+// (left to right, * and / before + and -, parentheses, negative numbers).
+namespace {
+struct R36SExpr
+{
+    const QString &s;
+    int p;
+    double x;
+    R36SExpr(const QString &str, double xv) : s(str), p(0), x(xv) {}
+    bool at(QChar c) { ws(); return p < s.size() && s.at(p) == c; }
+    void ws() { while (p < s.size() && s.at(p).isSpace()) p++; }
+    double primary()
+    {
+        ws();
+        if (p >= s.size()) return 0;
+        QChar c = s.at(p);
+        if (c == '-' || c == '+') { p++; double v = primary(); return c == '-' ? -v : v; }
+        if (c == '(') { p++; double v = sum(); if (at(')')) p++; return v; }
+        if (c == 'x' || c == 'X') { p++; return x; }
+        int start = p;
+        while (p < s.size() && (s.at(p).isDigit() || s.at(p) == '.')) p++;
+        if (start == p) { p++; return 0; }          // skip anything unexpected
+        return s.mid(start, p - start).toDouble();
+    }
+    double product()
+    {
+        double v = primary();
+        for (;;) {
+            if (at('*')) { p++; v *= primary(); }
+            else if (at('/')) { p++; double d = primary(); v = (d != 0) ? v / d : 0; }
+            else return v;
+        }
+    }
+    double sum()
+    {
+        double v = product();
+        for (;;) {
+            if (at('+')) { p++; v += product(); }
+            else if (at('-')) { p++; v -= product(); }
+            else return v;
+        }
+    }
+};
+}
+
+static double r36sEvalExpr(const QString &expr, double x)
+{
+    R36SExpr e(expr, x);
+    double v = e.sum();
+    return std::isnan(v) || std::isinf(v) ? 0 : v;
+}
+// ===== end R36S math =====
+
+#include <QDomDocument>
+#include <QFile>
+#include <QHash>
+#include <QPair>
+#include <QDir>
+#include <QTextStream>
+#include <QFrame>
+#include <QLabel>
+#include <QGridLayout>
+#include <QSplitter>
+#include <QTimer>
+#include <QFontMetrics>
+#include <QElapsedTimer>
+
+// ===== R36S: logging fixes =====
+// Value length/address is now read correctly from <address length=".."> in
+// FileActions::read_logger_definition_file(), so the old re-read is gone.
+
+// Request every byte of a value (address, address+1, ...)
+static void r36sAppendAddr(QByteArray &out, const QString &addrText, const QString &lenText)
+{
+    bool ok = false;
+    uint32_t a = addrText.toUInt(&ok, 16);
+    int n = qBound(1, lenText.toInt(), 4);
+    for (int k = 0; k < n; k++) {
+        uint32_t ak = a + k;
+        out.append((char)(uint8_t)(ak >> 16));
+        out.append((char)(uint8_t)(ak >> 8));
+        out.append((char)(uint8_t)ak);
+    }
+}
+
+// ===== R36S: log setup file, 6-box panel, min/max, switch logging =====
+// Logging is set up from a text file in FastECU-Files (editable over USB):
+//   /root/FastECU/Files/log_setup.txt   <- you edit this
+//   /root/FastECU/Files/available_parameters.txt   <- written on connect, lists names/IDs
+// "display" entries go in the 6 boxes, "log" entries are only recorded to CSV,
+// "switch" entries are switches recorded to CSV.
+
+static const QString R36S_FILES_DIR = "/root/FastECU/Files/";
+static const int R36S_MAX_DISPLAY = 6;
+static const int R36S_MAX_ADDRESSES = 80;   // one SSM A8 request: length byte limits it to ~84 addresses
+
+static QStringList r36sDisplayIds;                    // ids shown in the boxes, in order
+static QHash<int, QPair<double, double> > r36sMinMax; // value index -> (min, max) since logging started
+
+void r36sResetMinMax()
+{
+    r36sMinMax.clear();
+}
+
+// Unique switch byte addresses (and which switches use them) for one A8 request
+static QVector<uint32_t> r36sSwitchAddresses(FileActions::LogValuesStructure *lv, const QString &protocol)
+{
+    QVector<uint32_t> addrs;
+    for (int i = 0; i < lv->lower_panel_switch_id.length(); i++)
+    {
+        for (int j = 0; j < lv->log_switch_id.length(); j++)
+        {
+            if (lv->lower_panel_switch_id.at(i) == lv->log_switch_id.at(j) &&
+                lv->log_switch_protocol.at(j) == protocol &&
+                lv->log_switch_enabled.at(j) == "1")
+            {
+                bool ok = false;
+                uint32_t a = lv->log_switch_address.at(j).toUInt(&ok, 16) & 0xFFFFFF;
+                if (ok && !addrs.contains(a))
+                    addrs.append(a);
+                break;
+            }
+        }
+    }
+    return addrs;
+}
+
+// Indexes (into logValues lists) of values requested in one SSM A8 read, in order.
+// Only enabled values with an address are included, and only as many as fit in one request
+// (space for the switch bytes is kept free).
+static QVector<int> r36sLogValueIndexes(FileActions::LogValuesStructure *lv, const QString &protocol)
+{
+    QVector<int> indexes;
+    int budget = R36S_MAX_ADDRESSES - r36sSwitchAddresses(lv, protocol).length();
+    int used = 0;
+    for (int i = 0; i < lv->lower_panel_log_value_id.length(); i++)
+    {
+        for (int j = 0; j < lv->log_value_id.length(); j++)
+        {
+            if (lv->lower_panel_log_value_id.at(i) == lv->log_value_id.at(j) &&
+                lv->log_value_protocol.at(j) == protocol &&
+                lv->log_value_enabled.at(j) == "1" &&
+                !lv->log_value_address.at(j).isEmpty())
+            {
+                int len = qBound(1, lv->log_value_length.at(j).toInt(), 4);
+                if (used + len <= budget && !indexes.contains(j))
+                {
+                    indexes.append(j);
+                    used += len;
+                }
+                break;
+            }
+        }
+    }
+    return indexes;
+}
+
+static int r36sFindValue(FileActions::LogValuesStructure *lv, const QString &protocol, const QString &key)
+{
+    QString k = key.trimmed().toLower();
+    for (int j = 0; j < lv->log_value_id.length(); j++)
+    {
+        // only values the ECU can be asked for (calculated values have no address)
+        if (lv->log_value_protocol.at(j) != protocol || lv->log_value_enabled.at(j) != "1" || lv->log_value_address.at(j).isEmpty())
+            continue;
+        if (lv->log_value_id.at(j).toLower() == k || lv->log_value_name.at(j).trimmed().toLower() == k)
+            return j;
+    }
+    return -1;
+}
+
+static int r36sFindSwitch(FileActions::LogValuesStructure *lv, const QString &protocol, const QString &key)
+{
+    QString k = key.trimmed().toLower();
+    for (int j = 0; j < lv->log_switch_id.length(); j++)
+    {
+        if (lv->log_switch_protocol.at(j) != protocol || lv->log_switch_enabled.at(j) != "1")
+            continue;
+        if (lv->log_switch_id.at(j).toLower() == k || lv->log_switch_name.at(j).trimmed().toLower() == k)
+            return j;
+    }
+    return -1;
+}
+
+static QString r36sUnit(FileActions::LogValuesStructure *lv, int j)
+{
+    QStringList c = lv->log_value_units.at(j).split(",");
+    return c.length() > 1 ? c.at(1) : QString();
+}
+
+// Shown when log_setup.txt has no usable "display" lines (first 6 this ECU supports)
+static const QStringList R36S_DEFAULT_DISPLAY = {
+    "Engine Speed", "Coolant Temperature", "Manifold Relative Pressure", "IAM", "A/F Sensor #1",
+    "Ignition Total Timing", "Intake Air Temperature", "Mass Airflow", "Battery Voltage", "Engine Load (Relative)" };
+
+// Also load the extended values listed for other ECU IDs (log_setup.txt: extended_ecu_id = ...).
+// For a tune that reports its own ECU ID but uses the RAM layout of a known ROM.
+static int r36sAddExtendedFor(FileActions::LogValuesStructure *lv, const QStringList &ids)
+{
+    int added = 0;
+    if (lv->std_log_value_count < 0 || ids.isEmpty())
+        return 0;
+    for (int i = 0; i < lv->ext_id.length(); i++)
+    {
+        QStringList ecus = lv->ext_ecu_ids.at(i).split(',');
+        bool match = false;
+        for (const QString &id : ids)
+            if (ecus.contains(id)) { match = true; break; }
+        if (!match)
+            continue;
+        bool exists = false;
+        for (int j = lv->std_log_value_count; j < lv->log_value_id.length(); j++)
+            if (lv->log_value_id.at(j) == lv->ext_id.at(i) && lv->log_value_protocol.at(j) == lv->ext_protocol.at(i)) { exists = true; break; }
+        if (exists)
+            continue;
+        lv->log_value_protocol.append(lv->ext_protocol.at(i));
+        lv->log_value_id.append(lv->ext_id.at(i));
+        lv->log_value_name.append(lv->ext_name.at(i));
+        lv->log_value_description.append(lv->ext_description.at(i));
+        lv->log_value_ecu_byte_index.append("ext");
+        lv->log_value_ecu_bit.append("0");
+        lv->log_value_target.append(lv->ext_target.at(i));
+        lv->log_value_enabled.append("1");
+        lv->log_value.append("0.00");
+        lv->log_value_address.append(lv->ext_address.at(i));
+        lv->log_value_length.append(lv->ext_length.at(i));
+        lv->log_value_units.append(lv->ext_units.at(i));
+        lv->log_value_storagetype.append(lv->ext_storagetype.at(i));
+        lv->log_value_endian.append(lv->ext_endian.at(i));
+        added++;
+    }
+    return added;
+}
+
+// Up to 6 display ids: what FastECU already had, else the defaults this ECU supports
+static QStringList r36sFallbackDisplay(FileActions::LogValuesStructure *lv, const QString &protocol)
+{
+    QStringList ids;
+    for (const QString &id : lv->lower_panel_log_value_id)
+    {
+        int j = r36sFindValue(lv, protocol, id);
+        if (j >= 0 && !ids.contains(lv->log_value_id.at(j)) && ids.length() < R36S_MAX_DISPLAY)
+            ids.append(lv->log_value_id.at(j));
+    }
+    for (const QString &name : R36S_DEFAULT_DISPLAY)
+    {
+        int j = r36sFindValue(lv, protocol, name);
+        if (j >= 0 && !ids.contains(lv->log_value_id.at(j)) && ids.length() < R36S_MAX_DISPLAY)
+            ids.append(lv->log_value_id.at(j));
+    }
+    return ids;
+}
+
+static void r36sWriteTemplate(const QString &path, FileActions::LogValuesStructure *lv, const QString &protocol)
+{
+    QFile f(path);
+    if (!f.open(QFile::WriteOnly | QFile::Text))
+        return;
+    QTextStream out(&f);
+    out << "# FastECU logging setup - edit over USB.\n"
+           "# After saving, turn Logging off and on again in FastECU to reload.\n"
+           "#\n"
+           "# Use a parameter NAME or its ID, exactly as listed in available_parameters.txt\n"
+           "#   display = shown in the 6 boxes (2 across, 3 down), in this order (max 6)\n"
+           "#   log     = recorded to the CSV log file only (not shown)\n"
+           "#   switch  = switch recorded to the CSV log file\n"
+           "# Everything under display and log is recorded when \"Log to file\" is on.\n"
+           "#\n"
+           "# extended_ecu_id = also load the extended values listed for this ECU ID\n"
+           "#   (only for a tune built on that ROM - its RAM addresses must match)\n"
+           "# Lines starting with # are ignored.\n\n";
+    for (const QString &id : r36sFallbackDisplay(lv, protocol))
+    {
+        int j = lv->log_value_id.indexOf(id);
+        if (j >= 0)
+            out << "display = " << lv->log_value_name.at(j) << "\n";
+    }
+    out << "\n# log = Mass Airflow\n# switch = Clutch Switch\n# extended_ecu_id = 134271823F\n";
+}
+
+static void r36sWriteAvailable(const QString &path, FileActions::LogValuesStructure *lv, const QString &protocol,
+                               const QString &ecuid, const QStringList &notFound, const QStringList &notes)
+{
+    QFile f(path);
+    if (!f.open(QFile::WriteOnly | QFile::Text))
+        return;
+    QTextStream out(&f);
+    out << "# Parameters available for ECU ID " << ecuid << " (written by FastECU when it connects)\n"
+        << "# Copy a name, or the ID in [brackets], into log_setup.txt\n\n";
+    for (const QString &n : notes)
+        out << "# " << n << "\n";
+    if (!notes.isEmpty())
+        out << "\n";
+    if (!notFound.isEmpty())
+    {
+        out << "== NOT FOUND - check spelling in log_setup.txt ==\n";
+        for (const QString &n : notFound)
+            out << n << "\n";
+        out << "\n";
+    }
+    QStringList std_lines, ext_lines, sw_lines;
+    for (int j = 0; j < lv->log_value_id.length(); j++)
+    {
+        if (lv->log_value_protocol.at(j) != protocol || lv->log_value_enabled.at(j) != "1" || lv->log_value_address.at(j).isEmpty())
+            continue;
+        QString line = lv->log_value_name.at(j) + "  [" + lv->log_value_id.at(j) + "]  (" + r36sUnit(lv, j) + ")";
+        if (lv->log_value_ecu_byte_index.at(j) == "ext")
+            ext_lines.append(line);
+        else
+            std_lines.append(line);
+    }
+    for (int j = 0; j < lv->log_switch_id.length(); j++)
+    {
+        if (lv->log_switch_protocol.at(j) == protocol && lv->log_switch_enabled.at(j) == "1")
+            sw_lines.append(lv->log_switch_name.at(j) + "  [" + lv->log_switch_id.at(j) + "]");
+    }
+    std_lines.sort(Qt::CaseInsensitive);
+    ext_lines.sort(Qt::CaseInsensitive);
+    sw_lines.sort(Qt::CaseInsensitive);
+    out << "== Standard values (" << std_lines.length() << ") ==\n" << std_lines.join("\n") << "\n\n";
+    out << "== Extended values for this ECU ID (" << ext_lines.length() << ") ==\n" << ext_lines.join("\n") << "\n\n";
+    out << "== Switches (" << sw_lines.length() << ") ==\n" << sw_lines.join("\n") << "\n";
+}
+
+// Read log_setup.txt and set what is requested, shown and logged. Called on connect and when logging starts.
+void r36sApplyLogSetup(FileActions::LogValuesStructure *lv, const QString &protocol, const QString &ecuid)
+{
+    if (!lv)
+        return;
+    QDir dir(R36S_FILES_DIR);
+    if (!dir.exists())
+    {
+        // Not started through the R36S launcher: keep FastECU's own selection
+        r36sDisplayIds = lv->lower_panel_log_value_id.mid(0, R36S_MAX_DISPLAY);
+        return;
+    }
+    QString setupPath = dir.filePath("log_setup.txt");
+    if (!QFile::exists(setupPath))
+        r36sWriteTemplate(setupPath, lv, protocol);
+
+    QStringList display, logged, switches, notFound, notes;
+    QList<QPair<QString, QString> > entries;   // (kind, key) in file order
+    QStringList extraIds;
+    QFile f(setupPath);
+    if (f.open(QFile::ReadOnly | QFile::Text))
+    {
+        QTextStream in(&f);
+        while (!in.atEnd())
+        {
+            QString line = in.readLine().trimmed();
+            if (line.isEmpty() || line.startsWith('#'))
+                continue;
+            int eq = line.indexOf('=');
+            if (eq < 0)
+                continue;
+            QString kind = line.left(eq).trimmed().toLower();
+            QString key = line.mid(eq + 1).trimmed();
+            if (key.isEmpty())
+                continue;
+            if (kind == "extended_ecu_id")
+            {
+                for (const QString &id : key.toUpper().remove(' ').split(',', Qt::SkipEmptyParts))
+                    if (!extraIds.contains(id)) extraIds.append(id);
+                continue;
+            }
+            entries.append(qMakePair(kind, key));
+        }
+    }
+
+    // Extended values for extra ECU IDs must exist before names are matched
+    r36sAddExtendedFor(lv, extraIds);
+
+    for (const QPair<QString, QString> &e : entries)
+    {
+        {
+            QString kind = e.first;
+            QString key = e.second;
+            if (kind == "display" || kind == "log")
+            {
+                int j = r36sFindValue(lv, protocol, key);
+                if (j < 0) { notFound.append(kind + " = " + key); continue; }
+                QString id = lv->log_value_id.at(j);
+                if (kind == "display" && display.length() < R36S_MAX_DISPLAY && !display.contains(id))
+                    display.append(id);
+                else if (!logged.contains(id) && !display.contains(id))
+                    logged.append(id);
+            }
+            else if (kind == "switch")
+            {
+                int j = r36sFindSwitch(lv, protocol, key);
+                if (j < 0) { notFound.append(kind + " = " + key); continue; }
+                if (!switches.contains(lv->log_switch_id.at(j)))
+                    switches.append(lv->log_switch_id.at(j));
+            }
+        }
+    }
+
+    if (display.isEmpty())
+    {
+        // Never leave the boxes empty
+        display = r36sFallbackDisplay(lv, protocol);
+        for (const QString &id : display)
+            logged.removeAll(id);
+        notes << "log_setup.txt has no usable display lines - showing defaults. Add display = ... lines to choose.";
+    }
+
+    r36sDisplayIds = display;
+    lv->lower_panel_log_value_id = display + logged;   // request + CSV order: display first, then log
+    lv->lower_panel_switch_id = switches;
+
+    int extCount = 0;
+    for (int j = 0; j < lv->log_value_id.length(); j++)
+        if (lv->log_value_protocol.at(j) == protocol && lv->log_value_ecu_byte_index.at(j) == "ext")
+            extCount++;
+    notes.prepend("Extended values loaded: " + QString::number(extCount) +
+                  (extraIds.isEmpty() ? QString(" (for ECU ID ") + ecuid + ")"
+                                      : QString(" (ECU ID ") + ecuid + " + extended_ecu_id " + extraIds.join(",") + ")"));
+
+    if (!ecuid.isEmpty())
+        r36sWriteAvailable(dir.filePath("available_parameters.txt"), lv, protocol, ecuid, notFound, notes);
+}
+
+// ---- 6-box panel (2 across, 3 down) ----
+static void r36sPanelFitFonts(QWidget *panel)
+{
+    for (int i = 0; i < R36S_MAX_DISPLAY; i++)
+    {
+        QFrame *box = panel->findChild<QFrame*>("r36sBox" + QString::number(i));
+        if (!box) continue;
+        int h = box->height(), w = box->width();
+        QLabel *title = box->findChild<QLabel*>("r36sTitle");
+        QLabel *value = box->findChild<QLabel*>("r36sValue");
+        QLabel *minmax = box->findChild<QLabel*>("r36sMinMax");
+        int tpx = qBound(9, h * 17 / 100, 16);
+        int mpx = qBound(8, h * 14 / 100, 13);
+        int vpx = qBound(12, h * 40 / 100, 48);
+        QFont vf("Arial");
+        while (vpx > 12)
+        {
+            vf.setPixelSize(vpx);
+            if (QFontMetrics(vf).horizontalAdvance("-8888.88") <= w * 80 / 100) break;
+            vpx--;
+        }
+        QFont tf("Arial"); tf.setPixelSize(tpx); tf.setBold(true);
+        QFont mf("Arial"); mf.setPixelSize(mpx);
+        vf.setPixelSize(vpx);
+        if (title) title->setFont(tf);
+        if (minmax) minmax->setFont(mf);
+        if (value) { value->setFont(vf); value->setProperty("r36s_unit_px", qMax(8, vpx * 45 / 100)); }
+    }
+}
+
+class R36SPanelScaler : public QObject
+{
+public:
+    explicit R36SPanelScaler(QObject *parent) : QObject(parent) {}
+protected:
+    bool eventFilter(QObject *obj, QEvent *event) override
+    {
+        if (event->type() == QEvent::Resize)
+        {
+            QWidget *panel = qobject_cast<QWidget*>(obj);
+            QTimer::singleShot(0, panel, [panel]() { r36sPanelFitFonts(panel); });
+        }
+        return false;
+    }
+};
+
+static QWidget *r36sPanel(QWidget *area)
+{
+    QWidget *panel = area->findChild<QWidget*>("r36sPanel");
+    if (panel)
+        return panel;
+
+    // Hide the old log box grid and the switch row; the panel replaces them
+    if (QWidget *old = area->findChild<QWidget*>("r36sGridHost"))
+        old->hide();
+    QWidget *top = area->window();
+    if (QWidget *sw = top->findChild<QWidget*>("switchBoxWidget"))
+        sw->hide();
+
+    panel = new QWidget(area);
+    panel->setObjectName("r36sPanel");
+    QGridLayout *grid = new QGridLayout(panel);
+    grid->setContentsMargins(2, 2, 2, 2);
+    grid->setSpacing(3);
+    for (int i = 0; i < R36S_MAX_DISPLAY; i++)
+    {
+        QFrame *box = new QFrame(panel);
+        box->setObjectName("r36sBox" + QString::number(i));
+        box->setStyleSheet("QFrame#r36sBox" + QString::number(i) + "{border:1px solid black;border-radius:5px;}");
+        QVBoxLayout *v = new QVBoxLayout(box);
+        v->setContentsMargins(5, 2, 5, 2);
+        v->setSpacing(0);
+        QLabel *title = new QLabel(box);   title->setObjectName("r36sTitle");
+        QLabel *value = new QLabel(box);   value->setObjectName("r36sValue");
+        QLabel *minmax = new QLabel(box);  minmax->setObjectName("r36sMinMax");
+        title->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        minmax->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        minmax->setStyleSheet("color: grey;");
+        value->setTextFormat(Qt::RichText);
+        for (QLabel *l : {title, value, minmax})
+            l->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        v->addWidget(title);
+        v->addWidget(value, 1);
+        v->addWidget(minmax);
+        grid->addWidget(box, i / 2, i % 2);   // 2 across, 3 down
+    }
+    for (int r = 0; r < 3; r++) grid->setRowStretch(r, 1);
+    for (int c = 0; c < 2; c++) grid->setColumnStretch(c, 1);
+
+    if (QBoxLayout *outer = qobject_cast<QBoxLayout*>(area->layout()))
+        outer->addWidget(panel, 1);
+    panel->installEventFilter(new R36SPanelScaler(panel));
+
+    // Give the boxes a useful height the first time (the divider above can still be dragged)
+    if (QSplitter *split = qobject_cast<QSplitter*>(area->parentWidget()))
+    {
+        QTimer::singleShot(0, split, [split, area]() {
+            int total = split->height();
+            int want = qMin(total * 55 / 100, 260);
+            QList<int> sizes;
+            for (int k = 0; k < split->count(); k++)
+            {
+                QWidget *w = split->widget(k);
+                if (w == area) sizes << want;
+                else if (w->isHidden()) sizes << 0;
+                else sizes << qMax(0, total - want);
+            }
+            split->setSizes(sizes);
+        });
+    }
+    return panel;
+}
+
+// Titles/units for the 6 boxes (called when the selection changes)
+void r36sPanelSetup(QWidget *area, FileActions::LogValuesStructure *lv, const QString &protocol)
+{
+    if (!area || !lv) return;
+    QWidget *panel = r36sPanel(area);
+    QStringList ids = r36sDisplayIds;
+    if (ids.isEmpty())
+        ids = lv->lower_panel_log_value_id.mid(0, R36S_MAX_DISPLAY);
+    for (int i = 0; i < R36S_MAX_DISPLAY; i++)
+    {
+        QFrame *box = panel->findChild<QFrame*>("r36sBox" + QString::number(i));
+        if (!box) continue;
+        int index = -1;
+        if (i < ids.length())
+        {
+            for (int j = 0; j < lv->log_value_id.length(); j++)
+                if (lv->log_value_id.at(j) == ids.at(i) && lv->log_value_protocol.at(j) == protocol) { index = j; break; }
+        }
+        box->setProperty("r36s_index", index);
+        box->findChild<QLabel*>("r36sTitle")->setText(index >= 0 ? lv->log_value_name.at(index) : QString());
+        box->findChild<QLabel*>("r36sValue")->setText(index >= 0 ? "--" : QString());
+        box->findChild<QLabel*>("r36sMinMax")->setText(QString());
+    }
+    r36sPanelFitFonts(panel);
+}
+
+// Live values + min/max for the 6 boxes
+void r36sPanelUpdate(QWidget *area, FileActions::LogValuesStructure *lv)
+{
+    if (!area || !lv) return;
+    QWidget *panel = area->findChild<QWidget*>("r36sPanel");
+    if (!panel) return;
+    for (int i = 0; i < R36S_MAX_DISPLAY; i++)
+    {
+        QFrame *box = panel->findChild<QFrame*>("r36sBox" + QString::number(i));
+        if (!box) continue;
+        int j = box->property("r36s_index").toInt();
+        if (j < 0 || j >= lv->log_value.length()) continue;
+        QLabel *value = box->findChild<QLabel*>("r36sValue");
+        int upx = value->property("r36s_unit_px").toInt();
+        if (upx <= 0) upx = 10;
+        value->setText(lv->log_value.at(j) + " <span style=\"font-size:" + QString::number(upx) +
+                       "px; color:grey;\">" + r36sUnit(lv, j).toHtmlEscaped() + "</span>");
+        QHash<int, QPair<double, double> >::const_iterator it = r36sMinMax.constFind(j);
+        if (it != r36sMinMax.constEnd())
+        {
+            QString cur = lv->log_value.at(j);
+            int dec = cur.contains('.') ? cur.length() - cur.indexOf('.') - 1 : 0;
+            box->findChild<QLabel*>("r36sMinMax")->setText("min " + QString::number(it.value().first, 'f', dec) +
+                                                           "   max " + QString::number(it.value().second, 'f', dec));
+        }
+    }
+}
+// ===== end R36S log setup / panel =====
+
+// Raw ECU bytes -> number, using RomRaider storagetype/endian (extended params are often float)
+static double r36sRawValue(const QByteArray &data, int offset, int length, const QString &storagetype, const QString &endian)
+{
+    uint32_t raw = 0;
+    bool little = (endian == "little");
+    for (int k = 0; k < length && k < 4; k++)
+    {
+        uint8_t byte = (uint8_t)data.at(offset + (little ? (length - 1 - k) : k));
+        raw = (raw << 8) | byte;
+    }
+    if (storagetype == "float" && length == 4)
+    {
+        float f;
+        memcpy(&f, &raw, sizeof(f));
+        return f;
+    }
+    if (storagetype == "int8")  return (int8_t)raw;
+    if (storagetype == "int16") return (int16_t)raw;
+    if (storagetype == "int32") return (int32_t)raw;
+    return raw;
+}
+// ===== end R36S logging fixes =====
+
 
 void MainWindow::kline_listener()
 {
@@ -293,7 +913,6 @@ void MainWindow::log_ssm_values()
     QByteArray output;
     QByteArray received;
     uint16_t value_count = 0;
-    bool ok = false;
 
     if (ecu_init_complete)// && !log_params_request_started)
     {
@@ -311,19 +930,21 @@ void MainWindow::log_ssm_values()
             //emit LOG_D("Send log request";
             output.append((uint8_t)0xA8);
             output.append((uint8_t)0x01);
-            for (int i = 0; i < logValues->lower_panel_log_value_id.length(); i++)
+            // R36S: same value list is used to build request and parse reply
+            QVector<int> log_indexes = r36sLogValueIndexes(logValues, protocol);
+            for (int n = 0; n < log_indexes.length(); n++)
             {
-                for (int j = 0; j < logValues->log_value_id.length(); j++)
-                {
-                    if (logValues->lower_panel_log_value_id.at(i) == logValues->log_value_id.at(j) && logValues->log_value_protocol.at(j) == protocol)
-                    {
-                        value_count++;
-                        //emit LOG_D(logValues->log_value_id.at(i) << "at" << logValues->log_value_address.at(i) << "enabled, length" << logValues->log_value_length.at(i), true, true);
-                        output.append((uint8_t)(logValues->log_value_address.at(j).toUInt(&ok,16) >> 16));
-                        output.append((uint8_t)(logValues->log_value_address.at(j).toUInt(&ok,16) >> 8));
-                        output.append((uint8_t)logValues->log_value_address.at(j).toUInt(&ok,16));
-                    }
-                }
+                int j = log_indexes.at(n);
+                value_count++;
+                r36sAppendAddr(output, logValues->log_value_address.at(j), logValues->log_value_length.at(j));   // R36S
+            }
+            // R36S: switch bytes after the values (each byte holds up to 8 switches)
+            QVector<uint32_t> switch_addrs = r36sSwitchAddresses(logValues, protocol);
+            for (int n = 0; n < switch_addrs.length(); n++)
+            {
+                output.append((char)(uint8_t)(switch_addrs.at(n) >> 16));
+                output.append((char)(uint8_t)(switch_addrs.at(n) >> 8));
+                output.append((char)(uint8_t)switch_addrs.at(n));
             }
 /*
             for (int i = 0; i < logValues->dashboard_log_value_id.length(); i++)
@@ -334,9 +955,7 @@ void MainWindow::log_ssm_values()
                     {
                         value_count++;
                         //emit LOG_D(logValues->log_value_id.at(i) << "at" << logValues->log_value_address.at(i) << "enabled, length" << logValues->log_value_length.at(i), true, true);
-                        output.append((uint8_t)(logValues->log_value_address.at(j).toUInt(&ok,16) >> 16));
-                        output.append((uint8_t)(logValues->log_value_address.at(j).toUInt(&ok,16) >> 8));
-                        output.append((uint8_t)logValues->log_value_address.at(j).toUInt(&ok,16));
+                        r36sAppendAddr(output, logValues->log_value_address.at(j), logValues->log_value_length.at(j));   // R36S
                     }
                 }
             }*/
@@ -365,12 +984,17 @@ void MainWindow::read_log_serial_data()
                 loop_count++;
             }
             //emit LOG_D("Header data" << parse_message_to_hex(received), true, true);
-            loop_count = 0;
-            while (((uint8_t)received.at(0) != 0x80 || (uint8_t)received.at(1) != 0xf0 || (uint8_t)received.at(2) != 0x10) && loop_count < 200)
+            // R36S: look for the reply header without reading past an empty buffer,
+            // and give up after ~1.5 s so a missing reply can't hang the screen
+            QElapsedTimer sync_timer;
+            sync_timer.start();
+            while (sync_timer.elapsed() < 1500)
             {
-                received.remove(0, 1);
+                if (received.length() >= 3 && (uint8_t)received.at(0) == 0x80 && (uint8_t)received.at(1) == 0xf0 && (uint8_t)received.at(2) == 0x10)
+                    break;
+                if (received.length() >= 3)
+                    received.remove(0, 1);
                 received.append(serial->read_serial_data(50));
-                loop_count++;
             }
             received.append(serial->read_serial_data(50));
             received.append(serial->read_serial_data(100));
@@ -411,42 +1035,66 @@ QString MainWindow::parse_log_params(QByteArray received, QString protocol)
     {
         logging_request_active = true;
         //emit LOG_D("Log read count:" << logging_counter++, true, true);
-        for (int i = 0; i < logValues->lower_panel_log_value_id.length(); i++)
+        // R36S: walk the same list used for the request, byte offset advances by value length
+        QVector<int> log_indexes = r36sLogValueIndexes(logValues, protocol);
+        for (int n = 0; n < log_indexes.length(); n++)
         {
-            for (int j = 0; j < logValues->log_value_id.length(); j++)
+            int j = log_indexes.at(n);
+            int log_value_length = qBound(1, logValues->log_value_length.at(j).toInt(), 4);
+            if (log_value_index + log_value_length > received.length())
+                break;
+
+            QStringList conversion = logValues->log_value_units.at(j).split(",");
+            if (conversion.length() < 4)
             {
-                if (logValues->lower_panel_log_value_id.at(i) == logValues->log_value_id.at(j) && logValues->log_value_protocol.at(j) == protocol)
+                log_value_index += log_value_length;
+                continue;
+            }
+            QString from_byte = conversion.at(2);
+            QStringList format_str_lst = conversion.at(3).split(".");
+            uint8_t format = 0;
+            if (format_str_lst.length() > 1)
+                format = format_str_lst.at(1).count(QRegularExpression("0"));
+
+            double raw = r36sRawValue(received, log_value_index, log_value_length,
+                                      logValues->log_value_storagetype.at(j),
+                                      logValues->log_value_endian.at(j));
+            float calc_float_value = r36sEvalExpr(from_byte, raw);
+            QString calc_value = QString::number(calc_float_value, 'f', format);
+            logValues->log_value.replace(j, calc_value);
+
+            // R36S: min/max since logging started
+            QHash<int, QPair<double, double> >::iterator mm = r36sMinMax.find(j);
+            if (mm == r36sMinMax.end())
+                r36sMinMax.insert(j, qMakePair((double)calc_float_value, (double)calc_float_value));
+            else
+            {
+                mm.value().first = qMin(mm.value().first, (double)calc_float_value);
+                mm.value().second = qMax(mm.value().second, (double)calc_float_value);
+            }
+
+            log_value_index += log_value_length;
+        }
+
+        // R36S: switch bytes follow the values, in the same order they were requested
+        QVector<uint32_t> switch_addrs = r36sSwitchAddresses(logValues, protocol);
+        QHash<uint32_t, uint8_t> switch_bytes;
+        for (int n = 0; n < switch_addrs.length() && log_value_index < received.length(); n++)
+            switch_bytes.insert(switch_addrs.at(n), (uint8_t)received.at(log_value_index++));
+        for (int i = 0; i < logValues->lower_panel_switch_id.length(); i++)
+        {
+            for (int j = 0; j < logValues->log_switch_id.length(); j++)
+            {
+                if (logValues->log_switch_id.at(j) == logValues->lower_panel_switch_id.at(i) && logValues->log_switch_protocol.at(j) == protocol)
                 {
-                    if (logValues->log_value_enabled.at(j) == "1" && log_value_index < received.length())
+                    bool ok = false;
+                    uint32_t a = logValues->log_switch_address.at(j).toUInt(&ok, 16) & 0xFFFFFF;
+                    if (ok && switch_bytes.contains(a))
                     {
-                        QStringList conversion = logValues->log_value_units.at(j).split(",");
-                        QString value_name = logValues->log_value_name.at(j);
-                        QString unit = conversion.at(1);
-                        QString from_byte = conversion.at(2);
-                        QStringList format_str_lst = conversion.at(3).split(".");
-                        uint8_t format = 0;
-                        if (format_str_lst.length() > 1)
-                            format = format_str_lst.at(1).count(QRegularExpression("0"));
-
-                        //QString gauge_min = conversion.at(4);
-                        //QString gauge_max = conversion.at(5);
-                        //QString gauge_step = conversion.at(6);
-                        QString value;
-                        uint8_t log_value_length = logValues->log_value_length.at(j).toUInt();
-                        for (uint8_t k = 0; k < log_value_length; k++)
-                        {
-                            value.append(QString::number((uint8_t)received.at(i + k)));
-                        }
-                        float calc_float_value = fileActions->calculate_value_from_expression(fileActions->parse_stringlist_from_expression_string(from_byte, value));
-                        QString calc_value = QString::number(calc_float_value, 'f', format);
-                        logValues->log_value.replace(j, calc_value);
-
-                        //emit LOG_D(QString::number(log_value_index) + ". " + value_name + ": " + calc_value + " " + unit + " from_byte: " + value + " via expr: " + from_byte, true, true);
-                        //params.append(calc_value);
-                        //params.append(", ");
-
-                        log_value_index++;
+                        int bit = logValues->log_switch_ecu_bit.at(j).toInt();
+                        logValues->log_switch_state.replace(j, ((switch_bytes.value(a) >> bit) & 1) ? "1" : "0");
                     }
+                    break;
                 }
             }
         }
@@ -480,7 +1128,7 @@ QString MainWindow::parse_log_params(QByteArray received, QString protocol)
                         {
                             value.append(QString::number((uint8_t)received.at(log_value_index + k)));
                         }
-                        float calc_float_value = fileActions->calculate_value_from_expression(fileActions->parse_stringlist_from_expression_string(from_byte, value));
+                        float calc_float_value = r36sEvalExpr(from_byte, value.toDouble());
                         QString calc_value = QString::number(calc_float_value, 'f', format);
                         logValues->log_value.replace(j, calc_value);
 
@@ -525,6 +1173,10 @@ void MainWindow::parse_log_value_list(QByteArray received, QString protocol)
         if (logValues->log_value_protocol.at(i) == protocol)
         {
             logValues->log_values_by_protocol.append(logValues->log_value_name.at(i));
+
+            // R36S: extended values are enabled by ECU ID match, not init capability bits
+            if (logValues->log_value_ecu_byte_index.at(i) == "ext")
+                continue;
 
             uint16_t ecu_byte_index = logValues->log_value_ecu_byte_index.at(i).toUInt();
             if (ecu_byte_index < received.length() && logValues->log_value_ecu_byte_index.at(i) != "No byte index")
@@ -575,8 +1227,15 @@ void MainWindow::parse_log_value_list(QByteArray received, QString protocol)
             }
         }
     }
+    // R36S: add RomRaider extended params (ecuparam) that match the connected ECU ID
+    fileActions->add_extended_log_values(logValues, ecuid);
+
     fileActions->read_logger_conf(logValues, ecuid, false);
     //emit LOG_D("Log switches list ready", true, true);
+
+    // R36S: what to show/log comes from FastECU-Files/log_setup.txt
+    r36sApplyLogSetup(logValues, protocol, ecuid);
+    r36sResetMinMax();
 
     update_logboxes(protocol);
 }
@@ -644,28 +1303,28 @@ void MainWindow::log_to_file(){
 
             datalog_file_outstream.setDevice(&datalog_file);
             datalog_file_outstream << "Time,";
-            for (int j = 0; j < logValues->dashboard_log_value_id.count() ; j++){
-                datalog_file_outstream << logValues->log_value_name.at(logValues->log_value_id.indexOf(logValues->dashboard_log_value_id.at(j), 0)) << ",";
+            for (int j = 0; j < 0 /* R36S: gauge columns not logged */ ; j++){
+                datalog_file_outstream << logValues->log_value_name.value(logValues->log_value_id.indexOf(logValues->dashboard_log_value_id.at(j), 0)) << ",";
             }
             for (int j = 0; j < logValues->lower_panel_log_value_id.count() ; j++){
-                datalog_file_outstream << logValues->log_value_name.at(logValues->log_value_id.indexOf(logValues->lower_panel_log_value_id.at(j), 0)) << ",";
+                datalog_file_outstream << logValues->log_value_name.value(logValues->log_value_id.indexOf(logValues->lower_panel_log_value_id.at(j), 0)) << ",";
             }
-            for (int j = 0; j < logValues->lower_panel_switch_id.count() ; j++){
-                datalog_file_outstream << logValues->log_switch_name.at(logValues->log_switch_id.indexOf(logValues->lower_panel_switch_id.at(j),0)) << ",";
+            for (int j = 0; j < logValues->lower_panel_switch_id.count() /* R36S: switches from log_setup.txt */ ; j++){
+                datalog_file_outstream << logValues->log_switch_name.value(logValues->log_switch_id.indexOf(logValues->lower_panel_switch_id.at(j),0)) << ",";
             }
             datalog_file_outstream << "\n";
         }
         else{
 
             datalog_file_outstream << QString::number(log_file_timer->elapsed() / 1000.0f) << ",";
-            for (int j = 0; j < logValues->dashboard_log_value_id.count() ; j++){
-                datalog_file_outstream << logValues->log_value.at(logValues->log_value_id.indexOf(logValues->dashboard_log_value_id.at(j), 0)) << ",";
+            for (int j = 0; j < 0 /* R36S: gauge columns not logged */ ; j++){
+                datalog_file_outstream << logValues->log_value.value(logValues->log_value_id.indexOf(logValues->dashboard_log_value_id.at(j), 0)) << ",";
             }
             for (int j = 0; j < logValues->lower_panel_log_value_id.count() ; j++){
-                datalog_file_outstream << logValues->log_value.at(logValues->log_value_id.indexOf(logValues->lower_panel_log_value_id.at(j), 0)) << ",";
+                datalog_file_outstream << logValues->log_value.value(logValues->log_value_id.indexOf(logValues->lower_panel_log_value_id.at(j), 0)) << ",";
             }
-            for (int j = 0; j < logValues->lower_panel_switch_id.count() ; j++){
-                datalog_file_outstream << logValues->log_switch_state.at(logValues->log_switch_id.indexOf(logValues->lower_panel_switch_id.at(j), 0)) << ",";
+            for (int j = 0; j < logValues->lower_panel_switch_id.count() /* R36S: switches from log_setup.txt */ ; j++){
+                datalog_file_outstream << logValues->log_switch_state.value(logValues->log_switch_id.indexOf(logValues->lower_panel_switch_id.at(j), 0)) << ",";
             }
             datalog_file_outstream << "\n";
         }

@@ -1204,6 +1204,57 @@ void *FileActions::save_logger_conf(FileActions::LogValuesStructure *logValues, 
     return 0;
 }
 */
+/*
+ * Build FastECU conversion string from RomRaider <conversions> element:
+ * "conversion N,units,expr,format,gauge_min,gauge_max,gauge_step,..."
+ * storagetype/endian are taken from first conversion that defines them.
+ */
+static QString parse_logger_conversions(QDomElement conversions, QString &storagetype, QString &endian)
+{
+    QString param_conversion;
+    int conversion_count = 0;
+    QDomElement conversion = conversions.firstChild().toElement();
+    while (!conversion.isNull())
+    {
+        if (conversion.tagName() == "conversion")
+        {
+            param_conversion.append("conversion " + QString::number(conversion_count) + ",");
+            param_conversion.append(conversion.attribute("units","#") + ",");
+            param_conversion.append(conversion.attribute("expr","x") + ",");
+            param_conversion.append(conversion.attribute("format","0.00") + ",");
+            param_conversion.append(conversion.attribute("gauge_min","No gauge_min") + ",");
+            param_conversion.append(conversion.attribute("gauge_max","No gauge_max") + ",");
+            param_conversion.append(conversion.attribute("gauge_step","No gauge_step"));
+            if (storagetype.isEmpty())
+                storagetype = conversion.attribute("storagetype","").toLower();
+            if (conversion.hasAttribute("endian"))
+                endian = conversion.attribute("endian","big").toLower();
+        }
+        conversion_count++;
+        conversion = conversion.nextSibling().toElement();
+        if (!conversion.isNull())
+            param_conversion.append(",");
+    }
+    if (param_conversion.isEmpty())
+        param_conversion = "conversion 0,#,x,0.00,0,0,0";
+    return param_conversion;
+}
+
+/*
+ * Byte length of a log value: explicit length attribute wins,
+ * otherwise derived from storagetype, otherwise 1.
+ */
+static QString logger_value_length(QString length, QString storagetype)
+{
+    if (!length.isEmpty() && length.toUInt() > 0)
+        return length;
+    if (storagetype == "float" || storagetype == "uint32" || storagetype == "int32")
+        return "4";
+    if (storagetype == "uint16" || storagetype == "int16")
+        return "2";
+    return "1";
+}
+
 FileActions::LogValuesStructure *FileActions::read_logger_definition_file()
 {
     LogValuesStructure *logValues = &LogValuesStruct;
@@ -1297,42 +1348,34 @@ FileActions::LogValuesStructure *FileActions::read_logger_definition_file()
                                         if (log_value_index < 15)
                                             logValues->dashboard_log_value_id.append(log_value_id);
 
+                                        QString param_address = "";
+                                        QString param_length = parameter.attribute("length","");
+                                        QString param_conversion = "conversion 0,#,x,0.00,0,0,0";
+                                        QString param_storagetype = "";
+                                        QString param_endian = "big";
+
                                         QDomElement param_options = parameter.firstChild().toElement();
                                         while (!param_options.isNull())
                                         {
                                             if (param_options.tagName() == "address")
                                             {
-                                                //emit LOG_D("Address = " + param_options.text();
-                                                logValues->log_value_length.append(parameter.attribute("length","1"));
-                                                logValues->log_value_address.append(param_options.text());
+                                                // RomRaider puts length on <address length="2">
+                                                param_address = param_options.text().trimmed();
+                                                param_length = param_options.attribute("length", param_length);
                                             }
                                             if (param_options.tagName() == "conversions")
                                             {
-                                                QDomElement conversion = param_options.firstChild().toElement();
-                                                QString param_conversion;
-                                                int conversion_count = 0;
-                                                while (!conversion.isNull())
-                                                {
-                                                    if (conversion.tagName() == "conversion")
-                                                    {
-                                                        //emit LOG_D("Conversion = " + conversion.attribute("units","No units") + " " + conversion.attribute("expr","No expr") + " " + conversion.attribute("format","No format") + " " + conversion.attribute("gauge_min","0") + " " + conversion.attribute("gauge_max","0") + " " + conversion.attribute("gauge_step","0");
-                                                        param_conversion.append("conversion " + QString::number(conversion_count) + ",");
-                                                        param_conversion.append(conversion.attribute("units","#") + ",");
-                                                        param_conversion.append(conversion.attribute("expr","x") + ",");
-                                                        param_conversion.append(conversion.attribute("format","0.00") + ",");
-                                                        param_conversion.append(conversion.attribute("gauge_min","No gauge_min") + ",");
-                                                        param_conversion.append(conversion.attribute("gauge_max","No gauge_max") + ",");
-                                                        param_conversion.append(conversion.attribute("gauge_step","No gauge_step"));
-                                                    }
-                                                    conversion_count++;
-                                                    conversion = conversion.nextSibling().toElement();
-                                                    if (!conversion.isNull())
-                                                        param_conversion.append(",");
-                                                }
-                                                logValues->log_value_units.append(param_conversion);
+                                                param_conversion = parse_logger_conversions(param_options, param_storagetype, param_endian);
                                             }
                                             param_options = param_options.nextSibling().toElement();
                                         }
+                                        // Always append so all parallel lists stay aligned
+                                        // (calculated <depends> params have no address)
+                                        logValues->log_value_address.append(param_address);
+                                        logValues->log_value_length.append(logger_value_length(param_length, param_storagetype));
+                                        logValues->log_value_units.append(param_conversion);
+                                        logValues->log_value_storagetype.append(param_storagetype);
+                                        logValues->log_value_endian.append(param_endian);
                                         log_value_index++;
                                     }
                                     parameter = parameter.nextSibling().toElement();
@@ -1383,7 +1426,30 @@ FileActions::LogValuesStructure *FileActions::read_logger_definition_file()
                                 {
                                     if (ecuparam.tagName() == "ecuparam")
                                     {
-                                        //emit LOG_D("ECU param = " + ecuparam.attribute("id","No id") + " " + ecuparam.attribute("name","No name") + " " + ecuparam.attribute("desc","No description");
+                                        QString ext_conversion = "conversion 0,#,x,0.00,0,0,0";
+                                        QString ext_storagetype = "";
+                                        QString ext_endian = "big";
+                                        QDomElement ext_conversions = ecuparam.firstChildElement("conversions");
+                                        if (!ext_conversions.isNull())
+                                            ext_conversion = parse_logger_conversions(ext_conversions, ext_storagetype, ext_endian);
+
+                                        for (QDomElement ecu = ecuparam.firstChildElement("ecu"); !ecu.isNull(); ecu = ecu.nextSiblingElement("ecu"))
+                                        {
+                                            QDomElement address = ecu.firstChildElement("address");
+                                            if (address.isNull())
+                                                continue;
+                                            logValues->ext_protocol.append(log_value_protocol);
+                                            logValues->ext_id.append(ecuparam.attribute("id","No id"));
+                                            logValues->ext_name.append(ecuparam.attribute("name","No name"));
+                                            logValues->ext_description.append(ecuparam.attribute("desc","No desc"));
+                                            logValues->ext_target.append(ecuparam.attribute("target","No target"));
+                                            logValues->ext_ecu_ids.append(ecu.attribute("id","").toUpper().remove(' '));
+                                            logValues->ext_address.append(address.text().trimmed());
+                                            logValues->ext_length.append(logger_value_length(address.attribute("length",""), ext_storagetype));
+                                            logValues->ext_units.append(ext_conversion);
+                                            logValues->ext_storagetype.append(ext_storagetype);
+                                            logValues->ext_endian.append(ext_endian);
+                                        }
                                     }
                                     ecuparam = ecuparam.nextSibling().toElement();
                                 }
@@ -1398,9 +1464,80 @@ FileActions::LogValuesStructure *FileActions::read_logger_definition_file()
         }
     }
 
+    logValues->std_log_value_count = logValues->log_value_id.length();
+    emit LOG_D("Logger definition: " + QString::number(logValues->std_log_value_count) + " standard params, " + QString::number(logValues->ext_id.length()) + " extended param/ECU entries", true, true);
+
     //log_values_names_sorted
     //log_switch_names_sorted
     return logValues;
+}
+
+int FileActions::add_extended_log_values(LogValuesStructure *logValues, QString ecu_id)
+{
+    if (logValues->std_log_value_count < 0)
+        return 0;
+
+    // Remove extended values added for a previously connected ECU
+    while (logValues->log_value_id.length() > logValues->std_log_value_count)
+    {
+        logValues->log_value_protocol.removeLast();
+        logValues->log_value_id.removeLast();
+        logValues->log_value_name.removeLast();
+        logValues->log_value_description.removeLast();
+        logValues->log_value_ecu_byte_index.removeLast();
+        logValues->log_value_ecu_bit.removeLast();
+        logValues->log_value_target.removeLast();
+        logValues->log_value_enabled.removeLast();
+        logValues->log_value.removeLast();
+        logValues->log_value_address.removeLast();
+        logValues->log_value_length.removeLast();
+        logValues->log_value_units.removeLast();
+        logValues->log_value_storagetype.removeLast();
+        logValues->log_value_endian.removeLast();
+    }
+
+    ecu_id = ecu_id.toUpper().trimmed();
+    if (ecu_id.isEmpty())
+        return 0;
+
+    int added = 0;
+    for (int i = 0; i < logValues->ext_id.length(); i++)
+    {
+        if (!logValues->ext_ecu_ids.at(i).split(',').contains(ecu_id))
+            continue;
+
+        // Only one address per ecuparam id / protocol
+        bool exists = false;
+        for (int j = logValues->std_log_value_count; j < logValues->log_value_id.length(); j++)
+        {
+            if (logValues->log_value_id.at(j) == logValues->ext_id.at(i) && logValues->log_value_protocol.at(j) == logValues->ext_protocol.at(i))
+            {
+                exists = true;
+                break;
+            }
+        }
+        if (exists)
+            continue;
+
+        logValues->log_value_protocol.append(logValues->ext_protocol.at(i));
+        logValues->log_value_id.append(logValues->ext_id.at(i));
+        logValues->log_value_name.append(logValues->ext_name.at(i));
+        logValues->log_value_description.append(logValues->ext_description.at(i));
+        logValues->log_value_ecu_byte_index.append("ext");
+        logValues->log_value_ecu_bit.append("0");
+        logValues->log_value_target.append(logValues->ext_target.at(i));
+        logValues->log_value_enabled.append("1");
+        logValues->log_value.append("0.00");
+        logValues->log_value_address.append(logValues->ext_address.at(i));
+        logValues->log_value_length.append(logValues->ext_length.at(i));
+        logValues->log_value_units.append(logValues->ext_units.at(i));
+        logValues->log_value_storagetype.append(logValues->ext_storagetype.at(i));
+        logValues->log_value_endian.append(logValues->ext_endian.at(i));
+        added++;
+    }
+
+    emit LOG_D("Extended log values for ECU ID " + ecu_id + ": " + QString::number(added), true, true);
+    return added;
 }
 
 QSignalMapper *FileActions::read_menu_file(QMenuBar *menubar, QToolBar *toolBar)

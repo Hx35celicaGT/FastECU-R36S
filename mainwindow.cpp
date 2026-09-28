@@ -2,6 +2,142 @@
 #include "ui_mainwindow.h"
 #include <QSplashScreen>
 #include "serial_port_actions.h"
+#include <QGroupBox>
+#include <QLabel>
+#include <QTimer>
+#include <QFontMetrics>
+#include <QGridLayout>
+#include <algorithm>
+
+// ===== R36S: bottom log boxes in a resizable grid =====
+// The boxes live in a grid inside logBoxWidget. When you drag the area taller,
+// the boxes re-flow into more rows (fewer per row), so each box gets bigger,
+// and the titles and numbers are re-sized to fit.
+
+static QWidget *r36sGridHost(QWidget *area)
+{
+    return area ? area->findChild<QWidget*>("r36sGridHost") : nullptr;
+}
+
+static QList<QGroupBox*> r36sBoxes(QWidget *host)
+{
+    QList<QGroupBox*> boxes = host->findChildren<QGroupBox*>(QString(), Qt::FindDirectChildrenOnly);
+    std::sort(boxes.begin(), boxes.end(), [](QGroupBox *a, QGroupBox *b) {
+        return a->objectName().mid(13).toInt() < b->objectName().mid(13).toInt();   // "valueGroupBox" + index
+    });
+    return boxes;
+}
+
+// Size a value label to fit its box (bigger box = bigger number)
+static void r36sFitValueLabel(QWidget *box, QLabel *label)
+{
+    if (!box || !label) return;
+    int titlePx = box->property("r36s_title_px").toInt();
+    int px = qBound(12, (box->height() - titlePx) * 45 / 100, 90);
+    int maxW = box->width() - 10;
+    QFont f("Arial");
+    while (px > 10) {
+        f.setPixelSize(px);
+        if (QFontMetrics(f).horizontalAdvance("88.88") <= maxW) break;
+        px--;
+    }
+    f.setPixelSize(px);
+    if (label->property("r36s_px").toInt() != px) {
+        label->setProperty("r36s_px", px);
+        label->setFont(f);
+    }
+}
+
+// Size a box title to its box height
+static void r36sFitTitle(QGroupBox *gb)
+{
+    int px = qBound(8, gb->height() / 7, 20);
+    if (gb->property("r36s_title_px").toInt() == px) return;
+    gb->setProperty("r36s_title_px", px);
+    QFont t("Arial");
+    t.setPixelSize(px);
+    gb->setFont(t);
+    gb->setStyleSheet("QGroupBox{font: bold;border:1px solid black;border-radius:5px;margin-left: 1px; margin-right: 1px; margin-top: "
+                      + QString::number(px) + "px;} QGroupBox::title{subcontrol-origin: margin;left: 7px;padding:0px 3px 0px 3px;}");
+}
+
+// Pick the column count that gives the biggest numbers, place boxes, size text
+static void r36sScaleLogBoxes(QWidget *area)
+{
+    QWidget *host = r36sGridHost(area);
+    if (!host) return;
+    QGridLayout *grid = qobject_cast<QGridLayout*>(host->layout());
+    QList<QGroupBox*> boxes = r36sBoxes(host);
+    int n = boxes.count();
+    if (!grid || n == 0) return;
+
+    int W = host->width(), H = host->height();
+    int bestCols = n;
+    double bestScore = -1;
+    for (int cols = 1; cols <= n; cols++) {
+        int rows = (n + cols - 1) / cols;
+        double bw = double(W) / cols, bh = double(H) / rows;
+        double score = qMin(bh * 0.45, bw / 3.2);   // limited by height or by width
+        if (score > bestScore + 0.5) { bestScore = score; bestCols = cols; }
+    }
+
+    if (host->property("r36s_cols").toInt() != bestCols || host->property("r36s_n").toInt() != n) {
+        host->setProperty("r36s_cols", bestCols);
+        host->setProperty("r36s_n", n);
+        for (QGroupBox *gb : boxes) grid->removeWidget(gb);
+        for (int c = 0; c < 64; c++) grid->setColumnStretch(c, c < bestCols ? 1 : 0);
+        for (int r = 0; r < 64; r++) grid->setRowStretch(r, r < (n + bestCols - 1) / bestCols ? 1 : 0);
+        for (int i = 0; i < n; i++) {
+            boxes[i]->setMinimumSize(1, 1);                   // allow shrinking (no cut-off boxes)
+            boxes[i]->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+            grid->addWidget(boxes[i], i / bestCols, i % bestCols);
+        }
+    }
+    for (QGroupBox *gb : boxes) {
+        r36sFitTitle(gb);
+        for (QLabel *lbl : gb->findChildren<QLabel*>())
+            if (lbl->objectName().startsWith("log_label"))
+                r36sFitValueLabel(gb, lbl);
+    }
+}
+
+// Re-scale whenever the grid area is resized or its contents change
+class R36SBoxScaler : public QObject
+{
+public:
+    explicit R36SBoxScaler(QObject *parent) : QObject(parent) {}
+protected:
+    bool eventFilter(QObject *obj, QEvent *event) override
+    {
+        if (event->type() == QEvent::Resize || event->type() == QEvent::LayoutRequest) {
+            QWidget *area = qobject_cast<QWidget*>(obj)->parentWidget();
+            QTimer::singleShot(0, area, [area]() { r36sScaleLogBoxes(area); });
+        }
+        return false;
+    }
+};
+
+// Called once at startup
+static void r36sSetupLogGrid(QWidget *area)
+{
+    QWidget *host = new QWidget(area);
+    host->setObjectName("r36sGridHost");
+    QGridLayout *grid = new QGridLayout(host);
+    grid->setContentsMargins(0, 0, 0, 0);
+    grid->setSpacing(2);
+    if (QBoxLayout *outer = qobject_cast<QBoxLayout*>(area->layout()))
+        outer->addWidget(host, 1);
+    host->installEventFilter(new R36SBoxScaler(host));
+}
+
+
+
+// ===== end R36S grid =====
+
+// R36S: 6-box panel + log_setup.txt (defined in log_operations_ssm.cpp)
+void r36sPanelSetup(QWidget *area, FileActions::LogValuesStructure *lv, const QString &protocol);
+void r36sPanelUpdate(QWidget *area, FileActions::LogValuesStructure *lv);
+
 
 const QColor MainWindow::RED_LIGHT_OFF = QColor(96, 32, 32);
 const QColor MainWindow::YELLOW_LIGHT_OFF = QColor(96, 96, 32);
@@ -192,9 +328,9 @@ MainWindow::MainWindow(QString peerAddress, QString peerPassword, QWidget *paren
         emit ui->calibrationFilesTreeWidget->clicked(index);
     }
 */
-    connect(ui->switchBoxWidget, SIGNAL(customContextMenuRequested(QPoint)), this, SLOT(change_switch_values()));
-    connect(ui->logBoxWidget, SIGNAL(customContextMenuRequested(QPoint)), this, SLOT(change_digital_values()));
-    connect(ui->mdiArea, SIGNAL(customContextMenuRequested(QPoint)), this, SLOT(change_gauge_values()));
+    //connect(ui->switchBoxWidget, SIGNAL(customContextMenuRequested(QPoint)), this, SLOT(change_switch_values()));   // R36S: replaced by FastECU-Files/log_setup.txt
+    //connect(ui->logBoxWidget, SIGNAL(customContextMenuRequested(QPoint)), this, SLOT(change_digital_values()));   // R36S: replaced by FastECU-Files/log_setup.txt
+    //connect(ui->mdiArea, SIGNAL(customContextMenuRequested(QPoint)), this, SLOT(change_gauge_values()));   // R36S: replaced by FastECU-Files/log_setup.txt
     //connect(ui->action_Preferences, SIGNAL(triggered()), this, SLOT(openPreferences()));
     connect(ui->calibrationFilesTreeWidget, SIGNAL(itemClicked(QTreeWidgetItem *,int)), this, SLOT(calibration_files_treewidget_item_selected(QTreeWidgetItem*)));
     connect(ui->calibrationDataTreeWidget, SIGNAL(itemClicked(QTreeWidgetItem *,int)), this, SLOT(calibration_data_treewidget_item_selected(QTreeWidgetItem*)));
@@ -209,7 +345,7 @@ MainWindow::MainWindow(QString peerAddress, QString peerPassword, QWidget *paren
 
     status_bar_ecu_label->setText("");
     status_bar_ecu_label->setMargin(5);
-    status_bar_ecu_label->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Minimum);
+    status_bar_ecu_label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Minimum); status_bar_ecu_label->setMinimumWidth(1);   // R36S: long ECU text no longer widens the window
     //status_bar_ecu_label->setStyleSheet("QLabel { background-color : red; color : white; }");
 
     QWidget* status_bar_spacer = new QWidget();
@@ -226,12 +362,29 @@ MainWindow::MainWindow(QString peerAddress, QString peerPassword, QWidget *paren
     ui->calibrationDataTreeWidget->resizeColumnToContents(0);
     ui->calibrationDataTreeWidget->resizeColumnToContents(1);
     ui->calibrationFilesTreeWidget->setMinimumHeight(125);
+    // R36S: let the left panel shrink so tables get more room
+    ui->calibrationFilesTreeWidget->setMinimumWidth(80);
+    ui->calibrationFilesTreeWidget->setMinimumHeight(40);   // R36S
+    ui->calibrationFilesTreeWidget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);   // R36S
     ui->calibrationFilesTreeWidget->minimumHeight();
     ui->calibrationFilesTreeWidget->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(ui->calibrationFilesTreeWidget, SIGNAL(customContextMenuRequested(QPoint)), SLOT(custom_menu_requested(QPoint)));
 
     //ui->splitter->setStretchFactor(2, 1);
     ui->splitter->setSizes(QList<int>({125, INT_MAX}));
+    // R36S: put the bottom log/switch rows in a draggable splitter
+    {
+        QSplitter *r36sSplit = new QSplitter(Qt::Vertical, ui->centralwidget);
+        ui->gridLayout->removeWidget(ui->widget);
+        ui->gridLayout->removeWidget(ui->switchBoxWidget);
+        ui->gridLayout->removeWidget(ui->logBoxWidget);
+        r36sSplit->addWidget(ui->widget);
+        r36sSplit->addWidget(ui->switchBoxWidget);
+        r36sSplit->addWidget(ui->logBoxWidget);
+        r36sSplit->setStretchFactor(0, 1);
+        ui->gridLayout->addWidget(r36sSplit, 0, 0);
+        r36sSetupLogGrid(ui->logBoxWidget);   // R36S
+    }
 
     setSplashScreenProgress("Preparing remote connection...", 10);
     //Splash screen
@@ -1937,89 +2090,16 @@ void MainWindow::change_switch_values()
 
 void MainWindow::update_logboxes(QString protocol)
 {
-    int switchBoxCount = 20;
-    int logBoxCount = 12;
-
     emit LOG_D("Update logboxes with protocol: " + protocol, true, true);
-
-    while(!ui->switchBoxLayout->isEmpty()) {
-        QWidget *wg = ui->switchBoxLayout->takeAt(0)->widget();
-        delete wg;
-    }
-    while(!ui->logBoxLayout->isEmpty()) {
-        QWidget *wg = ui->logBoxLayout->takeAt(0)->widget();
-        delete wg;
-    }
-
-    for (int i = 0; i < logValues->lower_panel_switch_id.count(); i++)
-    {
-        for (int j = 0; j < logValues->log_switch_id.length(); j++)
-        {
-            if (logValues->lower_panel_switch_id.at(i) == logValues->log_switch_id.at(j) && logValues->log_switch_protocol.at(j) == protocol)
-            {
-                //emit LOG_D("Switch:" << logValues->log_switch_name.at(j);
-                QGroupBox *switchBox = logBoxes->drawLogBoxes("switch", i, switchBoxCount, logValues->log_switch_name.at(j), logValues->log_switch_name.at(j), logValues->log_switch_state.at(j));
-                switchBox->setAttribute(Qt::WA_TransparentForMouseEvents);
-                ui->switchBoxLayout->addWidget(switchBox);
-            }
-        }
-    }
-    for (int i = 0; i < logValues->lower_panel_log_value_id.count(); i++)
-    {
-        for (int j = 0; j < logValues->log_value_id.length(); j++)
-        {
-            if (logValues->lower_panel_log_value_id.at(i) == logValues->log_value_id.at(j) && logValues->log_value_protocol.at(j) == protocol)
-            {
-                //emit LOG_D("Log value:" << logValues->log_value_name.at(j);
-                QStringList value_unit = logValues->log_value_units.at(j).split(",");
-                QGroupBox *logBox = logBoxes->drawLogBoxes("log", i, logBoxCount, logValues->log_value_name.at(j), value_unit.at(1), logValues->log_value.at(j));
-                logBox->setAttribute(Qt::WA_TransparentForMouseEvents);
-                ui->logBoxLayout->addWidget(logBox);
-            }
-        }
-    }
+    // R36S: fixed 6-box panel (2 across, 3 down), set up from log_setup.txt
+    r36sPanelSetup(ui->logBoxWidget, logValues, protocol);
 }
 
 void MainWindow::update_logbox_values(QString protocol)
 {
-    int index = 0;
-    QString warningMin;
-    QString warningMax;
-    QString labelText;
-    QString label;
-    QString unit;
-
-    QScreen *screen = QGuiApplication::primaryScreen();
-    QRect size = screen->geometry();
-
-    for (int i = 0; i < logValues->lower_panel_log_value_id.length(); i++){
-        QWidget *wg = ui->logBoxLayout->itemAt(i)->widget();
-        QVBoxLayout* logVBoxLayout = wg->findChild<QVBoxLayout*>();
-        if (logVBoxLayout){
-            QLabel* log_label = wg->findChild<QLabel*>("log_label" + QString::number(i));
-            if (log_label){
-
-                for (int j = 0; j < logValues->log_value_id.count(); j++)
-                {
-                    if (logValues->log_value_id.at(j) == logValues->lower_panel_log_value_id.at(i) && logValues->log_value_protocol.at(j) == protocol)
-                        index = j;
-                }
-
-                unit = logValues->log_value_units.at(index).split(",").at(1);
-
-                labelText = logValues->log_value.at(index);
-                labelText.append(" <font size=1px color=grey>");
-                labelText.append(unit);
-                labelText.append("</font>");
-
-                log_label->setAlignment(Qt::AlignRight);
-                log_label->setText(labelText);
-                int labelFontSize = size.width() / 90;
-                QFont f("Arial",labelFontSize);
-                log_label->setFont(f);
-            }
-        }
-    }
+    Q_UNUSED(protocol)
+    // R36S: live values + min/max in the 6-box panel
+    r36sPanelUpdate(ui->logBoxWidget, logValues);
     delay(1);
 }
 

@@ -43,7 +43,7 @@ QGroupBox *LogBox::drawLogSwitchBox(uint8_t index, uint8_t switchBoxCount, QStri
     switchBoxLabel->setAlignment(Qt::AlignLeft);
     switchBoxLabel->setText(labelText);
     //int labelFontSize = size.width() / 180;
-    int labelFontSize = size.width() / 200;
+    int labelFontSize = qMax(size.width() / 200, 6);   // R36S: minimum size
     QFont f("Arial", labelFontSize, QFont::Bold);
     QFontMetrics fm(f);
     switchBoxLabel->setFont(f);
@@ -67,7 +67,7 @@ QGroupBox *LogBox::drawLogValueBox(uint8_t index, uint8_t logBoxCount, QString t
     logGroupBox->setObjectName("valueGroupBox" + QString::number(index));
     int minWidth = size.width() / (logBoxCount) / 2;
     int maxWidth = size.width() / (logBoxCount);
-    int groupBoxFontSize = size.width() / 170;
+    int groupBoxFontSize = qMax(size.width() / 170, 6);   // R36S: minimum size
     QFont t("Arial",groupBoxFontSize);
     logGroupBox->setStyleSheet("QGroupBox{font: bold;border:1px solid black;border-radius:5px;margin-left: 1px; margin-right: 1px; margin-top: "+QString::number(groupBoxFontSize)+"px;} QGroupBox::title{subcontrol-origin: margin;left: 7px;padding:0px 3px 0px 3px;}");
     logGroupBox->setMinimumWidth(minWidth);
@@ -85,7 +85,7 @@ QGroupBox *LogBox::drawLogValueBox(uint8_t index, uint8_t logBoxCount, QString t
     //logBoxLabel->setFixedWidth(100);
     logBoxLabel->setAlignment(Qt::AlignRight);
     logBoxLabel->setText(labelText);
-    int labelFontSize = size.width() / 90;
+    int labelFontSize = qMax(size.width() / 90, 12);   // R36S: minimum size
     QFont f("Arial",labelFontSize);
     //QFontMetrics fm(f);
     logBoxLabel->setFont(f);

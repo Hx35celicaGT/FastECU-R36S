@@ -887,6 +887,10 @@ void MainWindow::set_realtime_state(bool state)
     }
 }
 
+// R36S: defined in log_operations_ssm.cpp
+void r36sApplyLogSetup(FileActions::LogValuesStructure *lv, const QString &protocol, const QString &ecuid);
+void r36sResetMinMax();
+
 void MainWindow::toggle_realtime()
 {
     QAction *logger;
@@ -919,6 +923,11 @@ void MainWindow::toggle_realtime()
                 return;
             }
         }
+        // R36S: re-read FastECU-Files/log_setup.txt so edits apply without reconnecting
+        r36sApplyLogSetup(logValues, protocol, ecuid);
+        r36sResetMinMax();
+        update_logboxes(protocol);
+
         logging_counter = 0;
         logging_state = true;
         log_ssm_values();
