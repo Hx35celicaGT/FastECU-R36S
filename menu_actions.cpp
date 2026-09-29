@@ -890,6 +890,8 @@ void MainWindow::set_realtime_state(bool state)
 // R36S: defined in log_operations_ssm.cpp
 void r36sApplyLogSetup(FileActions::LogValuesStructure *lv, const QString &protocol, const QString &ecuid);
 void r36sResetMinMax();
+void r36sShowLogPanel(QWidget *area, bool show);
+
 
 void MainWindow::toggle_realtime()
 {
@@ -927,7 +929,7 @@ void MainWindow::toggle_realtime()
         r36sApplyLogSetup(logValues, protocol, ecuid);
         r36sResetMinMax();
         update_logboxes(protocol);
-
+        r36sShowLogPanel(ui->logBoxWidget, true);   // R36S: reveal the digital panel
         logging_counter = 0;
         logging_state = true;
         log_ssm_values();
@@ -946,7 +948,7 @@ void MainWindow::toggle_realtime()
         log_ssm_values();
         delay(200);
         logparams_poll_timer->stop();
-
+        r36sShowLogPanel(ui->logBoxWidget, false);  // R36S: hide the digital panel
         //disconnect_from_ecu();
     }
 }

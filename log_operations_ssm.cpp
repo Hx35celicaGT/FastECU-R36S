@@ -523,23 +523,7 @@ static QWidget *r36sPanel(QWidget *area)
         outer->addWidget(panel, 1);
     panel->installEventFilter(new R36SPanelScaler(panel));
 
-    // Give the boxes a useful height the first time (the divider above can still be dragged)
-    if (QSplitter *split = qobject_cast<QSplitter*>(area->parentWidget()))
-    {
-        QTimer::singleShot(0, split, [split, area]() {
-            int total = split->height();
-            int want = qMin(total * 55 / 100, 260);
-            QList<int> sizes;
-            for (int k = 0; k < split->count(); k++)
-            {
-                QWidget *w = split->widget(k);
-                if (w == area) sizes << want;
-                else if (w->isHidden()) sizes << 0;
-                else sizes << qMax(0, total - want);
-            }
-            split->setSizes(sizes);
-        });
-    }
+    area->hide();   // R36S: hidden until Logging is turned on (see r36sShowLogPanel)
     return panel;
 }
 
@@ -598,6 +582,30 @@ void r36sPanelUpdate(QWidget *area, FileActions::LogValuesStructure *lv)
 }
 // ===== end R36S log setup / panel =====
 
+// R36S: show the panel filling the screen when Logging starts, hide it when Logging stops.
+// The divider stays at the top edge, so it can still be dragged down to shrink the panel.
+void r36sShowLogPanel(QWidget *area, bool show)
+{
+    if (!area)
+        return;
+    if (!show)
+    {
+        area->hide();
+        return;
+    }
+    area->show();
+    if (QSplitter *split = qobject_cast<QSplitter*>(area->parentWidget()))
+    {
+        QTimer::singleShot(0, split, [split, area]() {
+            QList<int> sizes;
+            for (int k = 0; k < split->count(); k++)
+                sizes << (split->widget(k) == area ? split->height() : 0);
+            split->setSizes(sizes);
+        });
+    }
+}
+
+
 // Raw ECU bytes -> number, using RomRaider storagetype/endian (extended params are often float)
 static double r36sRawValue(const QByteArray &data, int offset, int length, const QString &storagetype, const QString &endian)
 {
@@ -620,6 +628,166 @@ static double r36sRawValue(const QByteArray &data, int offset, int length, const
     return raw;
 }
 // ===== end R36S logging fixes =====
+
+
+// ===== R36S: choose display / log / switch values on the device =====
+#include <QDialog>
+#include <QTabWidget>
+#include <QComboBox>
+#include <QListWidget>
+#include <QDialogButtonBox>
+#include <QFormLayout>
+#include <QMessageBox>
+
+// Rewrite the display/log/switch lines of log_setup.txt; comments and other lines stay
+static void r36sSaveLogSetup(const QStringList &display, const QStringList &logged, const QStringList &switches)
+{
+    QString path = QDir(R36S_FILES_DIR).filePath("log_setup.txt");
+    QStringList kept;
+    QFile in(path);
+    if (in.open(QFile::ReadOnly | QFile::Text))
+    {
+        QTextStream ts(&in);
+        while (!ts.atEnd())
+        {
+            QString line = ts.readLine();
+            QString t = line.trimmed();
+            int eq = t.indexOf('=');
+            QString kind = eq > 0 ? t.left(eq).trimmed().toLower() : QString();
+            if (!t.startsWith('#') && (kind == "display" || kind == "log" || kind == "switch"))
+                continue;
+            kept.append(line);
+        }
+        in.close();
+    }
+    while (!kept.isEmpty() && kept.last().trimmed().isEmpty())
+        kept.removeLast();
+    QFile out(path);
+    if (!out.open(QFile::WriteOnly | QFile::Text))
+        return;
+    QTextStream os(&out);
+    for (const QString &l : kept) os << l << "\n";
+    os << "\n";
+    for (const QString &n : display)  os << "display = " << n << "\n";
+    for (const QString &n : logged)   os << "log = " << n << "\n";
+    for (const QString &n : switches) os << "switch = " << n << "\n";
+}
+
+// Window to pick the 6 boxes, extra CSV values and switches. tab: 0 Display, 1 Log, 2 Switches.
+// Returns true when OK was pressed (log_setup.txt saved and applied).
+bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, const QString &protocol, const QString &ecuid, int tab)
+{
+    if (!lv)
+        return false;
+    if (!QDir(R36S_FILES_DIR).exists())
+    {
+        QMessageBox::information(parent, "Log values", "FastECU-Files is not available.\nStart FastECU with the R36S launcher or run-fastecu-pc.sh.");
+        return false;
+    }
+
+    // What this ECU supports (known after Connect to ECU)
+    QStringList names, switchNames;
+    for (int j = 0; j < lv->log_value_id.length(); j++)
+        if (lv->log_value_protocol.at(j) == protocol && lv->log_value_enabled.at(j) == "1" &&
+            !lv->log_value_address.at(j).isEmpty() && !names.contains(lv->log_value_name.at(j)))
+            names.append(lv->log_value_name.at(j));
+    for (int j = 0; j < lv->log_switch_id.length(); j++)
+        if (lv->log_switch_protocol.at(j) == protocol && lv->log_switch_enabled.at(j) == "1" &&
+            !switchNames.contains(lv->log_switch_name.at(j)))
+            switchNames.append(lv->log_switch_name.at(j));
+    if (names.isEmpty())
+    {
+        QMessageBox::information(parent, "Log values", "Connect to the ECU first, so FastECU knows which values it supports.");
+        return false;
+    }
+    names.sort(Qt::CaseInsensitive);
+    switchNames.sort(Qt::CaseInsensitive);
+
+    // Current selection, as names
+    auto valueName = [lv, protocol](const QString &id) {
+        for (int j = 0; j < lv->log_value_id.length(); j++)
+            if (lv->log_value_id.at(j) == id && lv->log_value_protocol.at(j) == protocol) return lv->log_value_name.at(j);
+        return QString();
+    };
+    auto switchName = [lv, protocol](const QString &id) {
+        for (int j = 0; j < lv->log_switch_id.length(); j++)
+            if (lv->log_switch_id.at(j) == id && lv->log_switch_protocol.at(j) == protocol) return lv->log_switch_name.at(j);
+        return QString();
+    };
+    QStringList curDisplay, curLogged, curSwitches;
+    for (const QString &id : r36sDisplayIds) curDisplay << valueName(id);
+    for (const QString &id : lv->lower_panel_log_value_id)
+        if (!r36sDisplayIds.contains(id)) curLogged << valueName(id);
+    for (const QString &id : lv->lower_panel_switch_id) curSwitches << switchName(id);
+
+    QDialog dlg(parent);
+    dlg.setWindowTitle("Log values");
+    dlg.resize(600, 420);   // fits the R36S 640 x 480 screen
+    QVBoxLayout *mainLayout = new QVBoxLayout(&dlg);
+    QTabWidget *tabs = new QTabWidget(&dlg);
+    mainLayout->addWidget(tabs);
+
+    // Display: one dropdown per box
+    QWidget *displayTab = new QWidget;
+    QFormLayout *form = new QFormLayout(displayTab);
+    QList<QComboBox*> boxes;
+    for (int i = 0; i < R36S_MAX_DISPLAY; i++)
+    {
+        QComboBox *cb = new QComboBox;
+        cb->addItem("(empty)");
+        cb->addItems(names);
+        cb->setMaxVisibleItems(12);
+        int k = i < curDisplay.length() ? cb->findText(curDisplay.at(i)) : -1;
+        cb->setCurrentIndex(k > 0 ? k : 0);
+        form->addRow(QString("Box %1 (%2, row %3)").arg(i + 1).arg(i % 2 == 0 ? "left" : "right").arg(i / 2 + 1), cb);
+        boxes << cb;
+    }
+    tabs->addTab(displayTab, "Display");
+
+    // Log / Switches: tap a row to select or unselect it (highlighted = on)
+    auto makeList = [](const QStringList &items, const QStringList &selected) {
+        QListWidget *list = new QListWidget;
+        list->setSelectionMode(QAbstractItemView::MultiSelection);
+        list->addItems(items);
+        for (int r = 0; r < list->count(); r++)
+            list->item(r)->setSelected(selected.contains(list->item(r)->text()));
+        return list;
+    };
+    QListWidget *logList = makeList(names, curLogged);
+    QListWidget *switchList = makeList(switchNames, curSwitches);
+    tabs->addTab(logList, "Log to CSV");
+    tabs->addTab(switchList, "Switches");
+    tabs->setCurrentIndex(qBound(0, tab, 2));
+
+    QLabel *note = new QLabel("Display values are always logged too. Highlighted rows are on. Fewer values = faster updates.");
+    note->setWordWrap(true);
+    mainLayout->addWidget(note);
+    QDialogButtonBox *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    mainLayout->addWidget(buttons);
+
+    if (dlg.exec() != QDialog::Accepted)
+        return false;
+
+    QStringList display, logged, switches;
+    for (QComboBox *cb : boxes)
+        if (cb->currentIndex() > 0 && !display.contains(cb->currentText()))
+            display << cb->currentText();
+    for (int r = 0; r < logList->count(); r++)
+        if (logList->item(r)->isSelected() && !display.contains(logList->item(r)->text()))
+            logged << logList->item(r)->text();
+    for (int r = 0; r < switchList->count(); r++)
+        if (switchList->item(r)->isSelected())
+            switches << switchList->item(r)->text();
+
+    r36sSaveLogSetup(display, logged, switches);
+    r36sApplyLogSetup(lv, protocol, ecuid);
+    r36sResetMinMax();
+    return true;
+}
+// ===== end R36S choose values =====
+
 
 
 void MainWindow::kline_listener()

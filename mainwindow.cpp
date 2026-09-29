@@ -2070,22 +2070,32 @@ void MainWindow::close_app()
 
     qApp->exit();
 }
+// R36S: pick display / log / switch values (saved to FastECU-Files/log_setup.txt)
+bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, const QString &protocol, const QString &ecuid, int tab);
+void r36sResetMinMax();
 
 void MainWindow::change_gauge_values()
 {
-    change_log_values(0, protocol);
-    //if (ecu_init_complete)
-    //    fileActions->read_logger_conf(logValues, ecuid, true);
+    change_digital_values();
 }
 
 void MainWindow::change_digital_values()
 {
-    change_log_values(1, protocol);
+    if (r36sLogSetupDialog(this, logValues, protocol, ecuid, 0))
+    {
+        update_logboxes(protocol);
+        if (logging_state)
+        {
+            log_ssm_values();   // ask the ECU for the new list of values
+            delay(300);         // let the old list's replies pass
+            r36sResetMinMax();
+        }
+    }
 }
 
 void MainWindow::change_switch_values()
 {
-    change_log_values(2, protocol);
+    change_digital_values();
 }
 
 void MainWindow::update_logboxes(QString protocol)
