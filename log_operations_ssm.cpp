@@ -149,7 +149,8 @@ static QVector<int> r36sLogValueIndexes(FileActions::LogValuesStructure *lv, con
             if (lv->lower_panel_log_value_id.at(i) == lv->log_value_id.at(j) &&
                 lv->log_value_protocol.at(j) == protocol &&
                 lv->log_value_enabled.at(j) == "1" &&
-                !lv->log_value_address.at(j).isEmpty())
+                !lv->log_value_address.at(j).isEmpty() &&
+                lv->log_value_ecu_byte_index.at(j) != "ard")   // R36S: Arduino values are not asked from the ECU
             {
                 int len = qBound(1, lv->log_value_length.at(j).toInt(), 4);
                 if (used + len <= budget && !indexes.contains(j))
@@ -331,6 +332,236 @@ static void r36sWriteAvailable(const QString &path, FileActions::LogValuesStruct
     out << "== Switches (" << sw_lines.length() << ") ==\n" << sw_lines.join("\n") << "\n";
 }
 
+// ===== R36S: Arduino (Nano) as an extra log device =====
+// The Nano prints a header, then one CSV line every 100 ms:
+//   time_ms,ethanol_pct,fuel_temp,fuel_psi,oil_psi,afr,knock1,knock2,spare
+// Each column becomes a log value named "... (Arduino)" that can be shown in the boxes
+// and logged to CSV next to the ECU values. Turn it on in log_setup.txt:
+//   arduino_port = auto            (or a port, e.g. /dev/ttyUSB1)
+//   arduino_baud = 115200          (optional, default 115200)
+//   arduino_units = fuel_temp:C    (optional unit overrides, column:unit, comma separated)
+#include <QSerialPort>
+#include <QSerialPortInfo>
+
+struct R36SArduinoColumn { const char *col; const char *name; const char *unit; bool minusOneIsMissing; };
+static const R36SArduinoColumn R36S_ARDUINO_COLUMNS[] = {
+    { "time_ms",     "Arduino Time (Arduino)",       "ms",    false },
+    { "ethanol_pct", "Ethanol Content (Arduino)",    "%",     true  },
+    { "fuel_temp",   "Fuel Temperature (Arduino)",   "F",     true  },
+    { "fuel_psi",    "Fuel Pressure (Arduino)",      "psi",   true  },
+    { "oil_psi",     "Oil Pressure (Arduino)",       "psi",   true  },
+    { "afr",         "Wideband AFR (Arduino)",       "AFR",   true  },
+    { "knock1",      "Knock 1 (Arduino)",            "level", false },
+    { "knock2",      "Knock 2 (Arduino)",            "level", false },
+    { "spare",       "Spare (Arduino)",              "",      false },
+};
+
+static QSerialPort *r36sArduinoPort = nullptr;
+static FileActions::LogValuesStructure *r36sArduinoLv = nullptr;
+static QString r36sArduinoProtocol;
+static QString r36sArduinoEcuPort;          // the OBD cable's port, never used for the Arduino
+static QStringList r36sArduinoColumns;       // column names from the Nano's header line
+static QByteArray r36sArduinoBuffer;
+static QElapsedTimer r36sArduinoLastLine;
+static QHash<QString, QString> r36sArduinoUnits;
+
+void r36sArduinoSetEcuPort(const QString &port)
+{
+    r36sArduinoEcuPort = port.split(" - ").at(0).trimmed();
+}
+
+static int r36sArduinoIndex(FileActions::LogValuesStructure *lv, const QString &col)
+{
+    QString id = "ARD_" + col;
+    for (int j = lv->log_value_id.length() - 1; j >= 0; j--)
+        if (lv->log_value_id.at(j) == id && lv->log_value_protocol.at(j) == r36sArduinoProtocol)
+            return j;
+    return -1;
+}
+
+// Add one log value for an Arduino column (once)
+static void r36sArduinoAddColumn(FileActions::LogValuesStructure *lv, const QString &col)
+{
+    if (col == "" || r36sArduinoIndex(lv, col) >= 0)
+        return;
+    QString name = col + " (Arduino)", unit;
+    for (const R36SArduinoColumn &c : R36S_ARDUINO_COLUMNS)
+        if (col == c.col) { name = c.name; unit = c.unit; }
+    if (r36sArduinoUnits.contains(col))
+        unit = r36sArduinoUnits.value(col);
+    lv->log_value_protocol.append(r36sArduinoProtocol);
+    lv->log_value_id.append("ARD_" + col);
+    lv->log_value_name.append(name);
+    lv->log_value_description.append("Arduino column " + col);
+    lv->log_value_ecu_byte_index.append("ard");   // not requested from the ECU
+    lv->log_value_ecu_bit.append("0");
+    lv->log_value_target.append("1");
+    lv->log_value_enabled.append("1");
+    lv->log_value.append("--");
+    lv->log_value_address.append("ard");
+    lv->log_value_length.append("1");
+    lv->log_value_units.append("conversion 0," + unit + ",x,0.00,0,0,0");
+    lv->log_value_storagetype.append("");
+    lv->log_value_endian.append("big");
+}
+
+static bool r36sArduinoMinusOneIsMissing(const QString &col)
+{
+    for (const R36SArduinoColumn &c : R36S_ARDUINO_COLUMNS)
+        if (col == c.col) return c.minusOneIsMissing;
+    return false;
+}
+
+static void r36sArduinoLine(const QByteArray &raw)
+{
+    FileActions::LogValuesStructure *lv = r36sArduinoLv;
+    QString line = QString::fromLatin1(raw).trimmed();
+    if (!lv || line.isEmpty())
+        return;
+    if (line.startsWith("time_ms,"))
+    {
+        // Header: remember the column order, add any columns we did not know about
+        r36sArduinoColumns = line.split(',');
+        for (QString &c : r36sArduinoColumns) c = c.trimmed();
+        for (const QString &c : r36sArduinoColumns) r36sArduinoAddColumn(lv, c);
+        return;
+    }
+    if (r36sArduinoColumns.isEmpty())
+        return;                                  // I2C scan lines etc. before the header
+    QStringList parts = line.split(',');
+    if (parts.length() != r36sArduinoColumns.length())
+        return;                                  // partial or garbled line
+    r36sArduinoLastLine.start();
+    for (int i = 0; i < parts.length(); i++)
+    {
+        const QString &col = r36sArduinoColumns.at(i);
+        int j = r36sArduinoIndex(lv, col);
+        if (j < 0) continue;
+        bool ok = false;
+        double v = parts.at(i).trimmed().toDouble(&ok);
+        if (!ok || (r36sArduinoMinusOneIsMissing(col) && v == -1))
+        {
+            lv->log_value.replace(j, "--");      // no reading: shown as -- and left out of min/max
+            continue;
+        }
+        lv->log_value.replace(j, parts.at(i).trimmed());
+        QHash<int, QPair<double, double> >::iterator mm = r36sMinMax.find(j);
+        if (mm == r36sMinMax.end())
+            r36sMinMax.insert(j, qMakePair(v, v));
+        else
+        {
+            mm.value().first = qMin(mm.value().first, v);
+            mm.value().second = qMax(mm.value().second, v);
+        }
+    }
+}
+
+// Pick the Arduino's port: the one set in log_setup.txt, or with "auto" the first
+// USB serial port that is not the OBD cable (Arduino / CH340 / FTDI chips first).
+static QString r36sArduinoFindPort(const QString &setting)
+{
+    if (setting.toLower() != "auto")
+        return setting;
+    QString fallback;
+    for (const QSerialPortInfo &p : QSerialPortInfo::availablePorts())
+    {
+        QString path = p.systemLocation();
+        if (path == r36sArduinoEcuPort || !(path.contains("ttyUSB") || path.contains("ttyACM")))
+            continue;
+        quint16 vid = p.hasVendorIdentifier() ? p.vendorIdentifier() : 0;
+        if (vid == 0x2341 || vid == 0x2A03 || vid == 0x1A86 || vid == 0x0403)
+            return path;
+        if (fallback.isEmpty())
+            fallback = path;
+    }
+    return fallback;
+}
+
+// Called from r36sApplyLogSetup (connect and Logging on): read the arduino_ settings,
+// make sure the Arduino values exist, open the port if needed. Returns a status line.
+QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString &protocol)
+{
+    QString portSetting, baud = "115200";
+    r36sArduinoUnits.clear();
+    QFile f(QDir(R36S_FILES_DIR).filePath("log_setup.txt"));
+    if (f.open(QFile::ReadOnly | QFile::Text))
+    {
+        QTextStream in(&f);
+        while (!in.atEnd())
+        {
+            QString line = in.readLine().trimmed();
+            if (line.startsWith('#')) continue;
+            int eq = line.indexOf('=');
+            if (eq < 0) continue;
+            QString kind = line.left(eq).trimmed().toLower();
+            QString val = line.mid(eq + 1).trimmed();
+            if (kind == "arduino_port") portSetting = val;
+            else if (kind == "arduino_baud") baud = val;
+            else if (kind == "arduino_units")
+                for (const QString &pair : val.split(',', Qt::SkipEmptyParts))
+                {
+                    int c = pair.indexOf(':');
+                    if (c > 0) r36sArduinoUnits.insert(pair.left(c).trimmed(), pair.mid(c + 1).trimmed());
+                }
+        }
+    }
+    if (portSetting.isEmpty())
+    {
+        if (r36sArduinoPort) { r36sArduinoPort->close(); }
+        return QStringList() << "Arduino: off (add  arduino_port = auto  to log_setup.txt to use it)";
+    }
+
+    r36sArduinoLv = lv;
+    r36sArduinoProtocol = protocol;
+    for (const R36SArduinoColumn &c : R36S_ARDUINO_COLUMNS) r36sArduinoAddColumn(lv, c.col);
+    for (const QString &c : r36sArduinoColumns) r36sArduinoAddColumn(lv, c);
+
+    if (!r36sArduinoPort)
+    {
+        r36sArduinoPort = new QSerialPort(qApp);
+        QObject::connect(r36sArduinoPort, &QSerialPort::readyRead, []() {
+            r36sArduinoBuffer.append(r36sArduinoPort->readAll());
+            int nl;
+            while ((nl = r36sArduinoBuffer.indexOf('\n')) >= 0)
+            {
+                r36sArduinoLine(r36sArduinoBuffer.left(nl));
+                r36sArduinoBuffer.remove(0, nl + 1);
+            }
+            if (r36sArduinoBuffer.size() > 4096) r36sArduinoBuffer.clear();
+        });
+        QObject::connect(r36sArduinoPort, &QSerialPort::errorOccurred, [](QSerialPort::SerialPortError e) {
+            if (e == QSerialPort::ResourceError) r36sArduinoPort->close();   // unplugged; reopened on next Logging on
+        });
+        // Values go to -- if the Nano stops sending
+        QTimer *stale = new QTimer(qApp);
+        QObject::connect(stale, &QTimer::timeout, []() {
+            if (!r36sArduinoLv || !r36sArduinoLastLine.isValid() || r36sArduinoLastLine.elapsed() < 1500) return;
+            for (const QString &c : r36sArduinoColumns)
+            {
+                int j = r36sArduinoIndex(r36sArduinoLv, c);
+                if (j >= 0) r36sArduinoLv->log_value.replace(j, "--");
+            }
+        });
+        stale->start(500);
+    }
+    if (r36sArduinoPort->isOpen())
+        return QStringList() << "Arduino: reading " + r36sArduinoPort->portName();
+
+    QString port = r36sArduinoFindPort(portSetting);
+    if (port.isEmpty())
+        return QStringList() << "Arduino: no USB serial port found besides the OBD cable (" + r36sArduinoEcuPort + ")";
+    r36sArduinoPort->setPortName(port);
+    r36sArduinoPort->setBaudRate(baud.toInt() > 0 ? baud.toInt() : 115200);
+    r36sArduinoColumns.clear();                  // wait for the header after the Nano restarts
+    r36sArduinoBuffer.clear();
+    if (!r36sArduinoPort->open(QIODevice::ReadOnly))
+        return QStringList() << "Arduino: could not open " + port + " (" + r36sArduinoPort->errorString() + ")";
+    return QStringList() << "Arduino: reading " + port + " at " + baud;
+}
+// ===== end R36S Arduino =====
+
+
+
 // Read log_setup.txt and set what is requested, shown and logged. Called on connect and when logging starts.
 void r36sApplyLogSetup(FileActions::LogValuesStructure *lv, const QString &protocol, const QString &ecuid)
 {
@@ -378,6 +609,8 @@ void r36sApplyLogSetup(FileActions::LogValuesStructure *lv, const QString &proto
 
     // Extended values for extra ECU IDs must exist before names are matched
     r36sAddExtendedFor(lv, extraIds);
+
+        notes << r36sArduinoUpdate(lv, protocol);   // R36S: Arduino values + port
 
     for (const QPair<QString, QString> &e : entries)
     {
@@ -1402,8 +1635,11 @@ void MainWindow::parse_log_value_list(QByteArray received, QString protocol)
     //emit LOG_D("Log switches list ready", true, true);
 
     // R36S: what to show/log comes from FastECU-Files/log_setup.txt
+    r36sArduinoSetEcuPort(serial_port);   // R36S: so the Arduino search skips the OBD cable
     r36sApplyLogSetup(logValues, protocol, ecuid);
     r36sResetMinMax();
+
+    
 
     update_logboxes(protocol);
 }
