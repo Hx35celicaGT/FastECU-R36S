@@ -1142,6 +1142,9 @@ int MainWindow::can_listener()
 
 int MainWindow::start_ecu_operations(QString cmd_type)
 {
+        // R36S: the R36S buttons are ignored while a ROM read/write runs (see r36sGuardAction)
+    extern bool r36sEcuBusy;
+    struct R36SBusy { R36SBusy() { r36sEcuBusy = true; } ~R36SBusy() { r36sEcuBusy = false; } } r36sBusy;
     set_realtime_state(false);
     toggle_realtime();
 

@@ -943,7 +943,7 @@ static QWidget *r36sPanel(QWidget *area)
         minmax->setStyleSheet("color: grey;");
         value->setTextFormat(Qt::RichText);
         for (QLabel *l : {title, value, minmax})
-            l->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+            l->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
         v->addWidget(title);
         v->addWidget(value, 1);
         v->addWidget(minmax);
@@ -1017,25 +1017,133 @@ void r36sPanelUpdate(QWidget *area, FileActions::LogValuesStructure *lv)
 
 // R36S: show the panel filling the screen when Logging starts, hide it when Logging stops.
 // The divider stays at the top edge, so it can still be dragged down to shrink the panel.
+#include <QMainWindow>
+#include <QStatusBar>
+#include <QMenuBar>
+#include <QMenu>
+#include <QAction>
+#include <QScreen>
+
+// If the window has grown past the screen (status bar pushed off the bottom), pull it back
+static void r36sKeepWindowOnScreen(QWidget *win)
+{
+    if (!win || win->isMaximized() || win->isFullScreen() || !win->screen())
+        return;
+    QSize avail = win->screen()->availableGeometry().size();
+    QSize now = win->size();
+    if (now.width() > avail.width() || now.height() > avail.height())
+        win->resize(qMin(now.width(), avail.width()), qMin(now.height(), avail.height()));
+}
+
 void r36sShowLogPanel(QWidget *area, bool show)
 {
     if (!area)
         return;
+    QWidget *win = area->window();
     if (!show)
     {
         area->hide();
+        QTimer::singleShot(0, win, [win]() { r36sKeepWindowOnScreen(win); });
         return;
     }
     area->show();
     if (QSplitter *split = qobject_cast<QSplitter*>(area->parentWidget()))
     {
-        QTimer::singleShot(0, split, [split, area]() {
+        QTimer::singleShot(0, split, [split, area, win]() {
             QList<int> sizes;
             for (int k = 0; k < split->count(); k++)
                 sizes << (split->widget(k) == area ? split->height() : 0);
             split->setSizes(sizes);
+            r36sKeepWindowOnScreen(win);
         });
     }
+}
+
+// R36S: tick/untick a menu item (e.g. "Logging", "Log to file") without running its action
+void r36sSetMenuChecked(QMenuBar *bar, const QString &text, bool checked)
+{
+    if (!bar)
+        return;
+    for (QMenu *menu : bar->findChildren<QMenu*>())
+        for (QAction *action : menu->actions())
+            if (!action->isSeparator() && !action->menu() && action->text() == text)
+                action->setChecked(checked);
+}
+
+static bool r36sMenuChecked(QMenuBar *bar, const QString &text)
+{
+    if (!bar)
+        return false;
+    for (QMenu *menu : bar->findChildren<QMenu*>())
+        for (QAction *action : menu->actions())
+            if (!action->isSeparator() && !action->menu() && action->text() == text)
+                return action->isChecked();
+    return false;
+}
+
+// R36S: CSV box in the status bar, right after the yellow/green/red connection box.
+//   recording -> green "Logging CSV"   armed (Log to file on, Logging off) -> grey "CSV ready"   else hidden
+void r36sShowCsvState(QMainWindow *win, bool armed, bool recording)
+{
+    if (!win)
+        return;
+    QStatusBar *bar = win->statusBar();
+    QLabel *label = bar->findChild<QLabel*>("r36sCsvLabel");
+    if (!label)
+    {
+        label = new QLabel(bar);
+        label->setObjectName("r36sCsvLabel");
+        label->setMargin(5);
+        bar->insertWidget(1, label);   // 0 = connection box
+    }
+    label->setProperty("r36s_state", recording ? 2 : (armed ? 1 : 0));
+    if (recording)
+    {
+        label->setText("Logging CSV");
+        label->setStyleSheet("QLabel { background-color : green; color : white; }");
+        label->show();
+    }
+    else if (armed)
+    {
+        label->setText("CSV ready");
+        label->setStyleSheet("QLabel { background-color : grey; color : white; }");
+        label->show();
+    }
+    else
+        label->hide();
+}
+
+// R36S: true while a ROM read/write runs (set in MainWindow::start_ecu_operations)
+bool r36sEcuBusy = false;
+
+// R36S: called first in menu_action_triggered. Returns true when the action must be ignored:
+//  - Logging, Log to file, Connect and Disconnect do nothing while a ROM read/write runs
+//  - Start (Logging off) does nothing while the CSV is recording: stop the CSV first (FN+Start)
+bool r36sGuardAction(QMainWindow *win, QMenuBar *bar, const QString &action, bool loggingState, bool writeCsv)
+{
+    if (r36sEcuBusy && (action == "toggle_realtime" || action == "log_to_file" ||
+                        action == "connect_to_ecu" || action == "disconnect_from_ecu"))
+    {
+        // undo the tick the key/click just changed
+        if (action == "toggle_realtime") r36sSetMenuChecked(bar, "Logging", loggingState);
+        if (action == "log_to_file")     r36sSetMenuChecked(bar, "Log to file", writeCsv);
+        return true;
+    }
+    if (action == "toggle_realtime" && loggingState && writeCsv && !r36sMenuChecked(bar, "Logging"))
+    {
+        r36sSetMenuChecked(bar, "Logging", true);
+        QLabel *label = win ? win->statusBar()->findChild<QLabel*>("r36sCsvLabel") : nullptr;
+        if (label)
+        {
+            label->setText("Stop CSV first (FN+Start)");
+            QTimer::singleShot(2000, label, [label]() {
+                if (label->property("r36s_state").toInt() == 2)
+                    label->setText("Logging CSV");
+            });
+        }
+        return true;
+    }
+    return false;
 }
 
 
@@ -1190,9 +1298,39 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
     QListWidget *switchList = makeList(switchNames, curSwitches);
     tabs->addTab(logList, "Log to CSV");
     tabs->addTab(switchList, "Switches");
+
+    // R36S: values shown in the boxes are always logged, so on the Log to CSV tab they are
+    // highlighted and locked (can't be unselected). Changing a box updates the list right away.
+    logList->setStyleSheet("QListWidget::item:selected:!enabled { background-color: #8fb4d9; color: #303030; }");
+    auto syncLog = [boxes, logList]() {
+        QStringList shown;
+        for (QComboBox *cb : boxes)
+            if (cb->currentIndex() > 0)
+                shown << cb->currentText();
+        for (int r = 0; r < logList->count(); r++)
+        {
+            QListWidgetItem *item = logList->item(r);
+            bool isShown = shown.contains(item->text());
+            if (isShown)
+            {
+                item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+                item->setSelected(true);
+                item->setToolTip("Shown in a box - always logged");
+            }
+            else if (!(item->flags() & Qt::ItemIsEnabled))
+            {
+                item->setFlags(item->flags() | Qt::ItemIsEnabled);   // left a box: stays logged until unselected
+                item->setToolTip(QString());
+            }
+        }
+    };
+    for (QComboBox *cb : boxes)
+        QObject::connect(cb, QOverload<int>::of(&QComboBox::currentIndexChanged), logList, [syncLog](int) { syncLog(); });
+    syncLog();
+
     tabs->setCurrentIndex(qBound(0, tab, 2));
 
-    QLabel *note = new QLabel("Display values are always logged too. Highlighted rows are on. Fewer values = faster updates.");
+    QLabel *note = new QLabel("Highlighted rows are logged. Light rows are shown in a box and always logged. Fewer values = faster updates.");
     note->setWordWrap(true);
     mainLayout->addWidget(note);
     QDialogButtonBox *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);

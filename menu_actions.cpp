@@ -2,8 +2,16 @@
 #include "ui_mainwindow.h"
 #include "serial_port_actions.h"
 
+// R36S: defined in log_operations_ssm.cpp
+bool r36sGuardAction(QMainWindow *win, QMenuBar *bar, const QString &action, bool loggingState, bool writeCsv);
+void r36sShowCsvState(QMainWindow *win, bool armed, bool recording);
+void r36sSetMenuChecked(QMenuBar *bar, const QString &text, bool checked);
+
 void MainWindow::menu_action_triggered(QString action)
 {
+        // R36S: ignore Logging/CSV/Connect/Disconnect during a ROM read/write, and Start while the CSV records
+    if (r36sGuardAction(this, ui->menubar, action, logging_state, write_datalog_to_file))
+        return;
     // FILE MENU
     if (action == "new"){
         qDebug() << action;}
@@ -930,6 +938,7 @@ void MainWindow::toggle_realtime()
         r36sResetMinMax();
         update_logboxes(protocol);
         r36sShowLogPanel(ui->logBoxWidget, true);   // R36S: reveal the digital panel
+        r36sShowCsvState(this, write_datalog_to_file, write_datalog_to_file);   // R36S: CSV box
         logging_counter = 0;
         logging_state = true;
         log_ssm_values();
@@ -949,6 +958,9 @@ void MainWindow::toggle_realtime()
         delay(200);
         logparams_poll_timer->stop();
         r36sShowLogPanel(ui->logBoxWidget, false);  // R36S: hide the digital panel
+        r36sSetMenuChecked(ui->menubar, "Log to file", false);   // R36S: CSV ends with Logging
+        write_datalog_to_file = false;
+        r36sShowCsvState(this, false, false);
         //disconnect_from_ecu();
     }
 }
@@ -967,6 +979,7 @@ void MainWindow::toggle_log_to_file()
                     write_datalog_to_file = action->isChecked();
             }
         }
+         r36sShowCsvState(this, write_datalog_to_file, write_datalog_to_file && logging_state);   // R36S: CSV box
     }
 
     if (!write_datalog_to_file){
