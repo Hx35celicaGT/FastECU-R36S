@@ -340,8 +340,18 @@ static void r36sWriteAvailable(const QString &path, FileActions::LogValuesStruct
 //   arduino_port = auto            (or a port, e.g. /dev/ttyUSB1)
 //   arduino_baud = 115200          (optional, default 115200)
 //   arduino_units = fuel_temp:C    (optional unit overrides, column:unit, comma separated)
+// If the Nano has no serial port (the R36S kernel has no FTDI driver), FastECU talks
+// to its FTDI FT232R chip directly over USB instead (see "FTDI direct" below).
 #include <QSerialPort>
 #include <QSerialPortInfo>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/usbdevice_fs.h>
 
 struct R36SArduinoColumn { const char *col; const char *name; const char *unit; bool minusOneIsMissing; };
 static const R36SArduinoColumn R36S_ARDUINO_COLUMNS[] = {
@@ -427,7 +437,16 @@ static void r36sArduinoLine(const QByteArray &raw)
         return;
     }
     if (r36sArduinoColumns.isEmpty())
-        return;                                  // I2C scan lines etc. before the header
+    {
+        // Header missed (Nano was already running): accept lines in the sketch's known column order
+        QStringList parts = line.split(',');
+        const int known = sizeof(R36S_ARDUINO_COLUMNS) / sizeof(R36S_ARDUINO_COLUMNS[0]);
+        bool numeric = (parts.length() == known);
+        for (const QString &p : parts) { bool ok = false; p.trimmed().toDouble(&ok); numeric = numeric && ok; }
+        if (!numeric)
+            return;                              // I2C scan lines etc. before the header
+        for (const R36SArduinoColumn &c : R36S_ARDUINO_COLUMNS) r36sArduinoColumns << c.col;
+    }
     QStringList parts = line.split(',');
     if (parts.length() != r36sArduinoColumns.length())
         return;                                  // partial or garbled line
@@ -454,6 +473,175 @@ static void r36sArduinoLine(const QByteArray &raw)
             mm.value().second = qMax(mm.value().second, v);
         }
     }
+}
+
+// ---- FTDI direct: talk to the Nano's FT232R chip over USB (no kernel driver needed) ----
+// Uses Linux usbfs (/dev/bus/usb/BBB/DDD). A reader thread collects the bytes; the
+// FastECU timer hands them to r36sArduinoLine on the main thread.
+static int r36sFtdiFd = -1;
+static std::thread r36sFtdiThread;
+static std::atomic<bool> r36sFtdiRun(false);
+static std::mutex r36sFtdiMutex;
+static QByteArray r36sFtdiIn;
+static QString r36sFtdiName;
+
+static bool r36sFtdiControl(int fd, int request, int value, int index)
+{
+    struct usbdevfs_ctrltransfer c;
+    memset(&c, 0, sizeof(c));
+    c.bRequestType = 0x40;                       // vendor request, host to device
+    c.bRequest = request;
+    c.wValue = value;
+    c.wIndex = index;
+    c.wLength = 0;
+    c.timeout = 1000;
+    c.data = nullptr;
+    return ioctl(fd, USBDEVFS_CONTROL, &c) >= 0;
+}
+
+// FT232R baud rate divisor (3 MHz base clock, 1/8 steps), as the FTDI driver computes it
+static void r36sFtdiBaudValue(int baud, int &value, int &index)
+{
+    static const int fracCode[8] = { 0, 3, 2, 4, 1, 5, 6, 7 };
+    int div8 = (3000000 * 8 + baud / 2) / baud;
+    uint32_t enc = (div8 >> 3) | (fracCode[div8 & 7] << 14);
+    if (enc == 1) enc = 0;                       // 3 Mbaud
+    else if (enc == 0x4001) enc = 1;             // 2 Mbaud
+    value = enc & 0xFFFF;
+    index = (enc >> 16) & 0xFFFF;
+}
+
+// Find an FT232R (0403:6001) in /sys and open it through usbfs
+static int r36sFtdiOpenDevice(QString &name)
+{
+    QDir sys("/sys/bus/usb/devices");
+    for (const QString &d : sys.entryList(QDir::Dirs | QDir::NoDotAndDotDot))
+    {
+        auto readAttr = [&](const char *a) {
+            QFile f(sys.filePath(d) + "/" + a);
+            return f.open(QFile::ReadOnly) ? QString(f.readAll()).trimmed() : QString();
+        };
+        if (readAttr("idVendor") != "0403" || readAttr("idProduct") != "6001")
+            continue;
+        QString path = QString("/dev/bus/usb/%1/%2").arg(readAttr("busnum").toInt(), 3, 10, QChar('0'))
+                                                    .arg(readAttr("devnum").toInt(), 3, 10, QChar('0'));
+        int fd = ::open(path.toLatin1().constData(), O_RDWR);
+        if (fd < 0)
+            continue;
+        unsigned int iface = 0;
+        if (ioctl(fd, USBDEVFS_CLAIMINTERFACE, &iface) < 0)
+        {
+            ::close(fd);                         // a driver owns it (then it has a serial port anyway)
+            continue;
+        }
+        name = "FTDI " + readAttr("product") + " at " + path;
+        return fd;
+    }
+    return -1;
+}
+
+static void r36sFtdiStop()
+{
+    r36sFtdiRun = false;
+    if (r36sFtdiThread.joinable())
+        r36sFtdiThread.join();
+    if (r36sFtdiFd >= 0)
+    {
+        unsigned int iface = 0;
+        ioctl(r36sFtdiFd, USBDEVFS_RELEASEINTERFACE, &iface);
+        ::close(r36sFtdiFd);
+        r36sFtdiFd = -1;
+    }
+}
+
+static bool r36sFtdiStart(int baud, QString &status)
+{
+    r36sFtdiStop();
+    QString name;
+    int fd = r36sFtdiOpenDevice(name);
+    if (fd < 0)
+        return false;
+    int value = 0, index = 0;
+    r36sFtdiBaudValue(baud, value, index);
+    bool ok = r36sFtdiControl(fd, 0, 0, 1)                 // reset
+           && r36sFtdiControl(fd, 3, value, index)         // baud rate
+           && r36sFtdiControl(fd, 4, 8, 1)                 // 8 data bits, no parity, 1 stop bit
+           && r36sFtdiControl(fd, 2, 0, 1)                 // no flow control
+           && r36sFtdiControl(fd, 9, 16, 1);               // latency timer 16 ms
+    if (!ok)
+    {
+        unsigned int iface = 0;
+        ioctl(fd, USBDEVFS_RELEASEINTERFACE, &iface);
+        ::close(fd);
+        status = "Arduino: found " + name + " but could not set it up (" + QString(strerror(errno)) + ")";
+        return true;
+    }
+    // Pulse DTR to restart the Nano, so its header line is sent again
+    r36sFtdiControl(fd, 1, 0x0101, 1);
+    QThread::msleep(50);
+    r36sFtdiControl(fd, 1, 0x0100, 1);
+
+    r36sFtdiFd = fd;
+    r36sFtdiName = name;
+    r36sFtdiRun = true;
+    r36sFtdiThread = std::thread([fd]() {
+        unsigned char buf[512];
+        while (r36sFtdiRun)
+        {
+            struct usbdevfs_bulktransfer b;
+            b.ep = 0x81;
+            b.len = sizeof(buf);
+            b.timeout = 200;
+            b.data = buf;
+            int n = ioctl(fd, USBDEVFS_BULK, &b);
+            if (n < 0)
+            {
+                if (errno == ETIMEDOUT) continue;
+                break;                               // unplugged; reopened on next Logging on
+            }
+            // Every 64-byte USB packet starts with 2 FTDI status bytes
+            QByteArray data;
+            for (int p = 0; p < n; p += 64)
+            {
+                int end = qMin(p + 64, n);
+                if (end - p > 2)
+                    data.append(reinterpret_cast<const char*>(buf + p + 2), end - p - 2);
+            }
+            if (!data.isEmpty())
+            {
+                std::lock_guard<std::mutex> lock(r36sFtdiMutex);
+                r36sFtdiIn.append(data);
+                if (r36sFtdiIn.size() > 8192) r36sFtdiIn.clear();
+            }
+        }
+        r36sFtdiRun = false;
+    });
+
+    // Main-thread timer: hand received lines to the parser
+    static QTimer *pump = nullptr;
+    if (!pump)
+    {
+        pump = new QTimer(qApp);
+        QObject::connect(pump, &QTimer::timeout, []() {
+            QByteArray data;
+            {
+                std::lock_guard<std::mutex> lock(r36sFtdiMutex);
+                data.swap(r36sFtdiIn);
+            }
+            if (data.isEmpty()) return;
+            r36sArduinoBuffer.append(data);
+            int nl;
+            while ((nl = r36sArduinoBuffer.indexOf('\n')) >= 0)
+            {
+                r36sArduinoLine(r36sArduinoBuffer.left(nl));
+                r36sArduinoBuffer.remove(0, nl + 1);
+            }
+            if (r36sArduinoBuffer.size() > 4096) r36sArduinoBuffer.clear();
+        });
+        pump->start(30);
+    }
+    status = "Arduino: reading " + name + " directly (no serial driver) at " + QString::number(baud);
+    return true;
 }
 
 // Pick the Arduino's port: the one set in log_setup.txt, or with "auto" the first
@@ -508,6 +696,7 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
     if (portSetting.isEmpty())
     {
         if (r36sArduinoPort) { r36sArduinoPort->close(); }
+        r36sFtdiStop();
         return QStringList() << "Arduino: off (add  arduino_port = auto  to log_setup.txt to use it)";
     }
 
@@ -546,10 +735,20 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
     }
     if (r36sArduinoPort->isOpen())
         return QStringList() << "Arduino: reading " + r36sArduinoPort->portName();
+    if (r36sFtdiRun)
+        return QStringList() << "Arduino: reading " + r36sFtdiName + " directly";
 
     QString port = r36sArduinoFindPort(portSetting);
     if (port.isEmpty())
-        return QStringList() << "Arduino: no USB serial port found besides the OBD cable (" + r36sArduinoEcuPort + ")";
+    {
+        // No serial port for the Nano (e.g. no FTDI driver on the R36S): talk to the chip directly
+        QString status;
+        r36sArduinoColumns.clear();
+        r36sArduinoBuffer.clear();
+        if (r36sFtdiStart(baud.toInt() > 0 ? baud.toInt() : 115200, status))
+            return QStringList() << status;
+        return QStringList() << "Arduino: no USB serial port or FTDI chip found besides the OBD cable (" + r36sArduinoEcuPort + ")";
+    }
     r36sArduinoPort->setPortName(port);
     r36sArduinoPort->setBaudRate(baud.toInt() > 0 ? baud.toInt() : 115200);
     r36sArduinoColumns.clear();                  // wait for the header after the Nano restarts
@@ -559,6 +758,7 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
     return QStringList() << "Arduino: reading " + port + " at " + baud;
 }
 // ===== end R36S Arduino =====
+
 
 
 
