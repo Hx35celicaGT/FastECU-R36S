@@ -2286,5 +2286,149 @@ QString r36sSetValueDialog(QWidget *parent, QTableWidget *table, bool *ok)
     if (ok) *ok = accepted;
     return accepted ? dlg.result() : QString();
 }
+
+
+// ===== R36S desktops (L1 / R1) =====
+// L1 and R1 send Shift+Tab and Tab. On the FastECU screen and on the other desktops they
+// switch desktops; in dialogs (Log values, Set value, Settings ...) they stay Tab / Shift+Tab.
+// Desktops 2-4 are pages in one separate full-screen window with no FastECU menu, toolbar or
+// status bar, so FastECU's shortcuts (Start, FN+Start, Connect ...) do not reach them.
+// Switching never opens or closes a window: pages flip inside that window, and going to or
+// from FastECU only raises one window above the other. Logging and CSV keep running.
+#include <QApplication>
+#include <QPointer>
+#include <QStackedWidget>
+
+static const char *R36S_DESKTOP_NAMES[] = { "FastECU", "CSV viewer", "2D / 3D", "Arduino control" };
+static const int R36S_DESKTOP_COUNT = 4;
+
+static QPointer<QMainWindow> r36sDeskMain;       // desktop 1 = FastECU main window
+static QPointer<QWidget> r36sDeskOverlay;        // one window holding desktops 2-4
+static QPointer<QStackedWidget> r36sDeskStack;   // its pages: index 0 = desktop 2
+
+// Fill one desktop. Each later step replaces the placeholder for its own desktop here.
+static void r36sDesktopBuild(int index, QWidget *page)
+{
+    QVBoxLayout *layout = new QVBoxLayout(page);
+    QLabel *title = new QLabel(R36S_DESKTOP_NAMES[index], page);
+    QFont font = title->font();
+    font.setPointSize(24);
+    font.setBold(true);
+    title->setFont(font);
+    title->setAlignment(Qt::AlignCenter);
+    QLabel *info = new QLabel(QString("Desktop %1 of %2\n\nComing soon\n\nL1 / R1: switch desktops")
+                                  .arg(index + 1).arg(R36S_DESKTOP_COUNT), page);
+    info->setAlignment(Qt::AlignCenter);
+    layout->addStretch();
+    layout->addWidget(title);
+    layout->addWidget(info);
+    layout->addStretch();
+}
+
+static QWidget *r36sDesktopOverlay()
+{
+    if (!r36sDeskOverlay)
+    {
+        // No parent, so it can go below FastECU; it does not keep FastECU open when FastECU closes
+        QWidget *w = new QWidget(nullptr, Qt::Window | Qt::FramelessWindowHint);
+        w->setObjectName("r36sDesktops");
+        w->setWindowTitle("FastECU desktops");
+        w->setAttribute(Qt::WA_QuitOnClose, false);
+        w->setFocusPolicy(Qt::StrongFocus);
+        w->setStyleSheet("QWidget#r36sDesktops { background-color: #202428; } QLabel { color: white; }");
+        QVBoxLayout *layout = new QVBoxLayout(w);
+        layout->setContentsMargins(0, 0, 0, 0);
+        QStackedWidget *stack = new QStackedWidget(w);
+        for (int i = 1; i < R36S_DESKTOP_COUNT; i++)
+        {
+            QWidget *page = new QWidget(stack);
+            r36sDesktopBuild(i, page);
+            stack->addWidget(page);
+        }
+        layout->addWidget(stack);
+        r36sDeskOverlay = w;
+        r36sDeskStack = stack;
+    }
+    return r36sDeskOverlay;
+}
+
+// Which desktop a window is: 0 = FastECU, 1-3 = the others, -1 = a dialog or anything else
+static int r36sDesktopIndexOf(QWidget *w)
+{
+    if (!w)
+        return -1;
+    if (w == r36sDeskMain)
+        return 0;
+    if (r36sDeskOverlay && w == r36sDeskOverlay && r36sDeskStack)
+        return r36sDeskStack->currentIndex() + 1;
+    return -1;
+}
+
+static void r36sDesktopShow(int current, int index)
+{
+    QMainWindow *win = r36sDeskMain;
+    if (!win)
+        return;
+    index = ((index % R36S_DESKTOP_COUNT) + R36S_DESKTOP_COUNT) % R36S_DESKTOP_COUNT;
+    if (index == current)
+        return;
+    if (index == 0)
+    {
+        win->raise();
+        win->activateWindow();
+        if (r36sDeskOverlay)
+            r36sDeskOverlay->lower();   // stays open behind FastECU
+        return;
+    }
+    QWidget *overlay = r36sDesktopOverlay();
+    r36sDeskStack->setCurrentIndex(index - 1);   // flip the page in place
+    if (current == 0)
+    {
+        overlay->setGeometry(win->geometry());   // same place and size as FastECU (full screen on the R36S)
+        if (!overlay->isVisible())
+            overlay->show();                     // only the first time
+        overlay->raise();
+        overlay->activateWindow();
+        overlay->setFocus();
+    }
+}
+
+class R36SDesktopSwitcher : public QObject
+{
+public:
+    explicit R36SDesktopSwitcher(QObject *parent) : QObject(parent) {}
+protected:
+    bool eventFilter(QObject *obj, QEvent *event) override
+    {
+        Q_UNUSED(obj)
+        if (event->type() != QEvent::KeyPress)
+            return false;
+        QKeyEvent *ke = static_cast<QKeyEvent*>(event);
+        if (ke->modifiers() & (Qt::ControlModifier | Qt::AltModifier))
+            return false;
+        bool prev = ke->key() == Qt::Key_Backtab ||
+                    (ke->key() == Qt::Key_Tab && (ke->modifiers() & Qt::ShiftModifier));
+        bool next = ke->key() == Qt::Key_Tab && !prev;
+        if (!next && !prev)
+            return false;
+        if (QApplication::activeModalWidget() || QApplication::activePopupWidget())
+            return false;                       // dialog or open list: normal Tab
+        int current = r36sDesktopIndexOf(QApplication::activeWindow());
+        if (current < 0)
+            return false;                       // non-desktop window: normal Tab
+        if (!ke->isAutoRepeat() && !r36sEcuBusy)
+            r36sDesktopShow(current, current + (next ? 1 : -1));
+        return true;                            // on a desktop Tab never moves focus
+    }
+};
+
+// Called once from the MainWindow constructor
+void r36sDesktopsInstall(QMainWindow *win)
+{
+    r36sDeskMain = win;
+    QObject::connect(win, &QObject::destroyed, []() { delete r36sDeskOverlay.data(); });
+    qApp->installEventFilter(new R36SDesktopSwitcher(win));
+}
+// ===== end R36S desktops =====
 // ===== end R36S Set value window =====
 

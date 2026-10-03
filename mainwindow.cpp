@@ -137,7 +137,7 @@ static void r36sSetupLogGrid(QWidget *area)
 // R36S: 6-box panel + log_setup.txt (defined in log_operations_ssm.cpp)
 void r36sPanelSetup(QWidget *area, FileActions::LogValuesStructure *lv, const QString &protocol);
 void r36sPanelUpdate(QWidget *area, FileActions::LogValuesStructure *lv);
-
+void r36sDesktopsInstall(QMainWindow *win);   // R36S: L1/R1 desktops (log_operations_ssm.cpp)
 
 const QColor MainWindow::RED_LIGHT_OFF = QColor(96, 32, 32);
 const QColor MainWindow::YELLOW_LIGHT_OFF = QColor(96, 96, 32);
@@ -384,6 +384,7 @@ MainWindow::MainWindow(QString peerAddress, QString peerPassword, QWidget *paren
         r36sSplit->setStretchFactor(0, 1);
         ui->gridLayout->addWidget(r36sSplit, 0, 0);
         r36sSetupLogGrid(ui->logBoxWidget);   // R36S
+                r36sDesktopsInstall(this);   // R36S: L1/R1 switch desktops
     }
 
     setSplashScreenProgress("Preparing remote connection...", 10);
