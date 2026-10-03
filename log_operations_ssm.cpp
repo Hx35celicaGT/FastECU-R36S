@@ -2074,3 +2074,217 @@ void MainWindow::log_to_file(){
     }
 }
 
+
+// ===== R36S: Set value window (D-pad friendly) =====
+// Opened by FN+A (key S) from MainWindow::set_value(). One scrolling row:
+//   [operation] [ ] [ ] [ ] [ ] [ ] [ ]      (6 number spots, empty to start)
+//   Left/Right   pick a spot (far left = operation)
+//   Up/Down      operation:  =  +  -  x  /
+//                number spot: (empty) 0 1 2 3 4 5 6 7 8 9 .
+//                first spot also has '-' when the operation is '=' (set a negative value)
+//   Empty spots are skipped, so  x .98   = 1000   x 1.27  are all fine.
+//   There is only one '.': putting it somewhere else moves it.
+//   Y / Enter = apply, B / Esc = cancel. On a keyboard you can also type 0-9 . = + - * /
+// Returns the same text the old typing box did ("=1000", "+20", "-5", "*0.98", "/2"),
+// so FastECU's own code does the math on every selected cell.
+#include <QKeyEvent>
+#include <QVBoxLayout>
+#include <QGridLayout>
+#include <QTableWidget>
+
+class R36SSetValueDialog : public QDialog
+{
+public:
+    explicit R36SSetValueDialog(QWidget *parent) : QDialog(parent)
+    {
+        setWindowTitle("Set value");
+        resize(520, 280);   // fits the R36S 640 x 480 screen
+
+        QVBoxLayout *main = new QVBoxLayout(this);
+        main->addStretch(1);
+        QGridLayout *grid = new QGridLayout;
+        grid->setHorizontalSpacing(6);
+        grid->setVerticalSpacing(0);
+        for (int k = 0; k < POS; k++)
+        {
+            for (int r = 0; r < 3; r++)
+            {
+                QLabel *l = new QLabel(this);
+                QFont f("Monospace");
+                f.setStyleHint(QFont::TypeWriter);
+                f.setBold(r == 1);
+                f.setPixelSize(r == 1 ? 48 : 24);
+                l->setFont(f);
+                l->setAlignment(Qt::AlignCenter);
+                l->setMinimumWidth(40);
+                grid->addWidget(l, r, k + 1);
+                cell[r][k] = l;
+            }
+        }
+        grid->setColumnStretch(0, 1);
+        grid->setColumnStretch(POS + 1, 1);
+        main->addLayout(grid);
+        main->addStretch(1);
+
+        message = new QLabel(this);
+        message->setAlignment(Qt::AlignCenter);
+        message->setStyleSheet("color: #b00000;");
+        main->addWidget(message);
+        QLabel *help = new QLabel("Left/Right: move   Up/Down: change   Y: apply   B: cancel", this);
+        help->setAlignment(Qt::AlignCenter);
+        main->addWidget(help);
+        refresh();
+    }
+
+    // The text FastECU's set_value() understands, empty if the number is not valid
+    QString result() const
+    {
+        bool ok = false;
+        double v = numberText().toDouble(&ok);
+        if (!ok) return QString();
+        static const char *ops[OPS] = { "=", "+", "-", "*", "/" };
+        return QString(ops[pick[0]]) + QString::number(v, 'g', 12);
+    }
+
+protected:
+    void keyPressEvent(QKeyEvent *e) override
+    {
+        int k = e->key();
+        message->clear();
+        if (k == Qt::Key_Escape) { reject(); return; }
+        if (k == Qt::Key_Return || k == Qt::Key_Enter)
+        {
+            if (numberText().isEmpty()) { message->setText("Enter a number first"); return; }
+            if (result().isEmpty())     { message->setText("Not a number"); return; }
+            if (pick[0] == 4 && numberText().toDouble() == 0.0) { message->setText("Cannot divide by zero"); return; }
+            accept();
+            return;
+        }
+        if (k == Qt::Key_Left && pos > 0) pos--;
+        else if (k == Qt::Key_Right && pos < POS - 1) pos++;
+        else if (k == Qt::Key_Up || k == Qt::Key_Down)
+        {
+            int step = (k == Qt::Key_Up) ? 1 : -1;
+            if (pos == 0) pick[0] = (pick[0] - step + OPS) % OPS;      // Up goes up the list  = + - x /
+            else { int n = choices(pos); setSpot(pos, (pick[pos] + step + n) % n); }   // Up: empty, 0..9, . (, -)
+        }
+        else if (k >= Qt::Key_0 && k <= Qt::Key_9)
+        {
+            if (pos == 0) pos = 1;
+            setSpot(pos, k - Qt::Key_0 + 1);
+            if (pos < POS - 1) pos++;
+        }
+        else if (k == Qt::Key_Period || k == Qt::Key_Comma)
+        {
+            if (pos == 0) pos = 1;
+            setSpot(pos, DOT);
+            if (pos < POS - 1) pos++;
+        }
+        else if (k == Qt::Key_Minus && pos == 1 && pick[0] == 0) { setSpot(1, MINUS); pos = 2; }
+        else if (k == Qt::Key_Equal)    { pick[0] = 0; }
+        else if (k == Qt::Key_Plus)     { pick[0] = 1; }
+        else if (k == Qt::Key_Minus)    { pick[0] = 2; }
+        else if (k == Qt::Key_Asterisk || k == Qt::Key_X) { pick[0] = 3; }
+        else if (k == Qt::Key_Slash)    { pick[0] = 4; }
+        else if (k == Qt::Key_Backspace || k == Qt::Key_Delete)
+        {
+            if (pos > 0) setSpot(pos, EMPTY);
+        }
+        else
+        {
+            QDialog::keyPressEvent(e);
+            return;
+        }
+        refresh();
+    }
+
+private:
+    static const int POS = 7;       // 0 = operation, 1..6 = number spots
+    static const int OPS = 5;
+    // number spot choices: 0 = empty, 1..10 = digits 0..9, 11 = '.', 12 = '-'
+    static const int EMPTY = 0;
+    static const int DOT = 11;
+    static const int MINUS = 12;
+    static const int CHOICES = 12;  // without '-'
+    int pick[POS] = {1};            // operation starts at '+', number spots empty
+    int pos = 0;
+    QLabel *cell[3][POS];           // row 0 = what Up gives, 1 = current, 2 = what Down gives
+    QLabel *message = nullptr;
+
+    static QString opChar(int i) { static const char *c[OPS] = { "=", "+", "-", "x", "/" }; return c[(i + OPS) % OPS]; }
+    static QString spotChar(int i, int n)
+    {
+        i = (i + n) % n;
+        if (i == EMPTY) return QString();
+        if (i == DOT)   return ".";
+        if (i == MINUS) return "-";
+        return QString::number(i - 1);
+    }
+
+    // '-' is only offered on the first spot while the operation is '='
+    int choices(int p) const { return (p == 1 && pick[0] == 0) ? CHOICES + 1 : CHOICES; }
+
+    // Only one '.': putting it somewhere empties the old one
+    void setSpot(int p, int v)
+    {
+        pick[p] = v;
+        if (v == DOT)
+            for (int k = 1; k < POS; k++)
+                if (k != p && pick[k] == DOT) pick[k] = EMPTY;
+        if (v == MINUS && p != 1)
+            pick[p] = EMPTY;
+    }
+
+    QString numberText() const   // empty spots are skipped
+    {
+        QString s;
+        for (int k = 1; k < POS; k++) s += spotChar(pick[k], CHOICES + 1);
+        return s;
+    }
+
+    void refresh()
+    {
+        if (pick[0] != 0 && pick[1] == MINUS)
+            pick[1] = EMPTY;        // '-' only exists with '='
+        for (int k = 0; k < POS; k++)
+        {
+            bool sel = (k == pos);
+            QString up, now, down;
+            if (k == 0)
+            {
+                up = opChar(pick[0] - 1); now = opChar(pick[0]); down = opChar(pick[0] + 1);
+            }
+            else
+            {
+                int n = choices(k);
+                up = spotChar(pick[k] + 1, n); now = spotChar(pick[k], n); down = spotChar(pick[k] - 1, n);
+                if (up.isEmpty())   up = "_";
+                if (down.isEmpty()) down = "_";
+            }
+            bool empty = now.isEmpty();
+            cell[0][k]->setText(sel ? up : QString());
+            cell[1][k]->setText(empty ? "_" : now);
+            cell[2][k]->setText(sel ? down : QString());
+            cell[0][k]->setStyleSheet("QLabel { color: #808080; }");
+            cell[2][k]->setStyleSheet("QLabel { color: #808080; }");
+            QString style;
+            if (sel)         style = "background-color: #2f7fd0; color: white; border-radius: 4px;";
+            else if (k == 0) style = "color: #2f7fd0;";
+            else if (empty)  style = "color: #b0b0b0;";
+            else             style = "color: black;";
+            cell[1][k]->setStyleSheet("QLabel { " + style + " }");
+        }
+    }
+};
+
+// Called from MainWindow::set_value() instead of the old typing box
+QString r36sSetValueDialog(QWidget *parent, QTableWidget *table, bool *ok)
+{
+    Q_UNUSED(table)
+    R36SSetValueDialog dlg(parent);
+    bool accepted = dlg.exec() == QDialog::Accepted;
+    if (ok) *ok = accepted;
+    return accepted ? dlg.result() : QString();
+}
+// ===== end R36S Set value window =====
+

@@ -6,6 +6,7 @@
 bool r36sGuardAction(QMainWindow *win, QMenuBar *bar, const QString &action, bool loggingState, bool writeCsv);
 void r36sShowCsvState(QMainWindow *win, bool armed, bool recording);
 void r36sSetMenuChecked(QMenuBar *bar, const QString &text, bool checked);
+QString r36sSetValueDialog(QWidget *parent, QTableWidget *table, bool *ok);
 
 void MainWindow::menu_action_triggered(QString action)
 {
@@ -357,11 +358,12 @@ void MainWindow::set_value()
         QTableWidget* mapTableWidget = w->findChild<QTableWidget*>(w->objectName());
         if (mapTableWidget)
         {
-            QString text = QInputDialog::getText(this, tr("QInputDialog::getText()"),
-                                                       tr("Set value: (ie: x20 | +20 | -20 | /20 | 20)"),
-                                                       QLineEdit::Normal, "", &bStatus);
+            QString text = r36sSetValueDialog(this, mapTableWidget, &bStatus);   // R36S: D-pad Set value window
 
             text.replace(",", ".");
+            bool r36sSetTo = text.startsWith('=');   // R36S: "=" means set to this value (negatives allowed)
+            if (r36sSetTo)
+                text.remove(0, 1);
 
             if (bStatus && !text.isEmpty()){
                 QStringList map_data_cell_text = ecuCalDef[rom_number]->MapData.at(map_number).split(",");
@@ -435,7 +437,9 @@ void MainWindow::set_value()
                             uint16_t map_value_index = j * map_x_size + i;
                             QString rom_data_value = get_rom_data_value(rom_number, map_data_address, map_value_index, map_value_storagetype, map_value_endian);
 
-                            if (text.at(0) == '+'){
+                            if (r36sSetTo)
+                                map_item_value = text.toFloat();
+                            else if (text.at(0) == '+'){
                                 QStringList mapItemText = text.split("+");
                                 map_item_value = map_item_value + mapItemText[1].toFloat();
                             }
