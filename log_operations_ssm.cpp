@@ -3182,6 +3182,97 @@ void r36sCsvLiveRow(const QStringList &row)
 }
 // ===== end R36S CSV viewer =====
 
+// ===== R36S pointer: hides when not in use =====
+// The stick cursor hides as soon as the D-pad (or Y) is used, or after 3 s without stick
+// movement. While it is hidden, A, X and L3 clicks are ignored, so a click can never land
+// on whatever the hidden pointer is resting on. Moving the stick brings it back where it was.
+// The right stick (scroll wheel) works either way. Y always acts on the selection.
+static const int R36S_POINTER_IDLE_MS = 3000;
+
+class R36SPointerHider : public QObject
+{
+public:
+    explicit R36SPointerHider(QObject *parent) : QObject(parent)
+    {
+        idle = new QTimer(this);
+        idle->setSingleShot(true);
+        idle->setInterval(R36S_POINTER_IDLE_MS);
+        connect(idle, &QTimer::timeout, this, [this]() { hide(); });
+        last = QCursor::pos();
+        idle->start();
+    }
+protected:
+    bool eventFilter(QObject *obj, QEvent *event) override
+    {
+        Q_UNUSED(obj)
+        switch (event->type())
+        {
+        case QEvent::MouseMove:
+        {
+            QPoint now = QCursor::pos();
+            if (now != last)             // real stick movement, not a synthetic move
+            {
+                last = now;
+                show();
+                idle->start();
+            }
+            break;
+        }
+        case QEvent::MouseButtonPress:
+        case QEvent::MouseButtonDblClick:
+            if (hidden)
+            {
+                swallowed = true;
+                return true;             // pointer hidden: the click is ignored
+            }
+            idle->start();
+            break;
+        case QEvent::MouseButtonRelease:
+            if (swallowed)
+            {
+                if (QGuiApplication::mouseButtons() == Qt::NoButton)
+                    swallowed = false;
+                return true;             // the matching release of an ignored click
+            }
+            idle->start();
+            break;
+        case QEvent::KeyPress:
+        {
+            int key = static_cast<QKeyEvent*>(event)->key();
+            if (key == Qt::Key_Up || key == Qt::Key_Down || key == Qt::Key_Left || key == Qt::Key_Right ||
+                key == Qt::Key_Return || key == Qt::Key_Enter)
+                hide();                  // D-pad or Y: keys are in charge now
+            break;
+        }
+        default:
+            break;
+        }
+        return false;
+    }
+private:
+    QTimer *idle;
+    QPoint last;
+    bool hidden = false, swallowed = false;
+
+    void hide()
+    {
+        if (hidden || QGuiApplication::mouseButtons() != Qt::NoButton)   // never in the middle of a drag
+            return;
+        hidden = true;
+        QGuiApplication::setOverrideCursor(Qt::BlankCursor);
+    }
+    void show()
+    {
+        if (!hidden)
+            return;
+        hidden = false;
+        QGuiApplication::restoreOverrideCursor();
+    }
+};
+// ===== end R36S pointer =====
+
+
+
 // ===== R36S desktops (L1 / R1) =====
 // L1 and R1 send Shift+Tab and Tab. On the FastECU screen and on the other desktops they
 // switch desktops; in dialogs (Log values, Set value, Settings ...) they stay Tab / Shift+Tab.
@@ -3324,6 +3415,7 @@ void r36sDesktopsInstall(QMainWindow *win)
     r36sDeskMain = win;
     QObject::connect(win, &QObject::destroyed, []() { delete r36sDeskOverlay.data(); });
     qApp->installEventFilter(new R36SDesktopSwitcher(win));
+    qApp->installEventFilter(new R36SPointerHider(win));   // R36S: pointer hides when not in use
 }
 // ===== end R36S desktops =====
 
