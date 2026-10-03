@@ -874,7 +874,7 @@ static void r36sPanelFitFonts(QWidget *panel)
         QLabel *value = box->findChild<QLabel*>("r36sValue");
         QLabel *minmax = box->findChild<QLabel*>("r36sMinMax");
         int tpx = qBound(9, h * 17 / 100, 16);
-        int mpx = qBound(8, h * 14 / 100, 13);
+        int mpx = tpx;   // R36S: min/max same size as the title
         int vpx = qBound(12, h * 40 / 100, 48);
         QFont vf("Arial");
         while (vpx > 12)
@@ -940,10 +940,11 @@ static QWidget *r36sPanel(QWidget *area)
         title->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
         value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         minmax->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        minmax->setStyleSheet("color: grey;");
+        minmax->setStyleSheet("color: black;");
         value->setTextFormat(Qt::RichText);
         for (QLabel *l : {title, value, minmax})
-            l->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+            l->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+            value->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);   // R36S: only the big number shrinks
         v->addWidget(title);
         v->addWidget(value, 1);
         v->addWidget(minmax);
@@ -1002,7 +1003,7 @@ void r36sPanelUpdate(QWidget *area, FileActions::LogValuesStructure *lv)
         int upx = value->property("r36s_unit_px").toInt();
         if (upx <= 0) upx = 10;
         value->setText(lv->log_value.at(j) + " <span style=\"font-size:" + QString::number(upx) +
-                       "px; color:grey;\">" + r36sUnit(lv, j).toHtmlEscaped() + "</span>");
+                       "px; color:black;\">" + r36sUnit(lv, j).toHtmlEscaped() + "</span>");
         QHash<int, QPair<double, double> >::const_iterator it = r36sMinMax.constFind(j);
         if (it != r36sMinMax.constEnd())
         {
