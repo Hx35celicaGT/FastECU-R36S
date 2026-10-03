@@ -2021,6 +2021,10 @@ uint8_t MainWindow::calculate_checksum(QByteArray output, bool dec_0x100)
     return checksum;
 }
 
+// R36S: the CSV viewer (desktop 2) gets each row as it is written (defined further down)
+void r36sCsvLiveStart(const QString &path, const QStringList &header);
+void r36sCsvLiveRow(const QStringList &row);
+
 void MainWindow::log_to_file(){
     if (write_datalog_to_file){
         if (!datalog_file_open){
@@ -2045,31 +2049,45 @@ void MainWindow::log_to_file(){
             }
 
             datalog_file_outstream.setDevice(&datalog_file);
+            QStringList r36sHeader;   // R36S: the same header goes to the CSV viewer
+            r36sHeader << "Time";
             datalog_file_outstream << "Time,";
-            for (int j = 0; j < 0 /* R36S: gauge columns not logged */ ; j++){
-                datalog_file_outstream << logValues->log_value_name.value(logValues->log_value_id.indexOf(logValues->dashboard_log_value_id.at(j), 0)) << ",";
-            }
             for (int j = 0; j < logValues->lower_panel_log_value_id.count() ; j++){
-                datalog_file_outstream << logValues->log_value_name.value(logValues->log_value_id.indexOf(logValues->lower_panel_log_value_id.at(j), 0)) << ",";
+                QString name = logValues->log_value_name.value(logValues->log_value_id.indexOf(logValues->lower_panel_log_value_id.at(j), 0));
+                datalog_file_outstream << name << ",";
+                r36sHeader << name;
             }
             for (int j = 0; j < logValues->lower_panel_switch_id.count() /* R36S: switches from log_setup.txt */ ; j++){
-                datalog_file_outstream << logValues->log_switch_name.value(logValues->log_switch_id.indexOf(logValues->lower_panel_switch_id.at(j),0)) << ",";
+                QString name = logValues->log_switch_name.value(logValues->log_switch_id.indexOf(logValues->lower_panel_switch_id.at(j),0));
+                datalog_file_outstream << name << ",";
+                r36sHeader << name;
             }
             datalog_file_outstream << "\n";
+            r36sCsvLiveStart(log_file_name, r36sHeader);   // R36S
         }
         else{
-
-            datalog_file_outstream << QString::number(log_file_timer->elapsed() / 1000.0f) << ",";
-            for (int j = 0; j < 0 /* R36S: gauge columns not logged */ ; j++){
-                datalog_file_outstream << logValues->log_value.value(logValues->log_value_id.indexOf(logValues->dashboard_log_value_id.at(j), 0)) << ",";
-            }
+            QStringList r36sRow;      // R36S: the same row goes to the CSV viewer
+            QString time = QString::number(log_file_timer->elapsed() / 1000.0f);
+            datalog_file_outstream << time << ",";
+            r36sRow << time;
             for (int j = 0; j < logValues->lower_panel_log_value_id.count() ; j++){
-                datalog_file_outstream << logValues->log_value.value(logValues->log_value_id.indexOf(logValues->lower_panel_log_value_id.at(j), 0)) << ",";
+                QString value = logValues->log_value.value(logValues->log_value_id.indexOf(logValues->lower_panel_log_value_id.at(j), 0));
+                datalog_file_outstream << value << ",";
+                r36sRow << value;
             }
             for (int j = 0; j < logValues->lower_panel_switch_id.count() /* R36S: switches from log_setup.txt */ ; j++){
-                datalog_file_outstream << logValues->log_switch_state.value(logValues->log_switch_id.indexOf(logValues->lower_panel_switch_id.at(j), 0)) << ",";
+                QString value = logValues->log_switch_state.value(logValues->log_switch_id.indexOf(logValues->lower_panel_switch_id.at(j), 0));
+                datalog_file_outstream << value << ",";
+                r36sRow << value;
             }
             datalog_file_outstream << "\n";
+            // R36S: write to the card about once a second, so a crash or power cut loses at most a second
+            static QElapsedTimer r36sFlushClock;
+            if (!r36sFlushClock.isValid() || r36sFlushClock.elapsed() >= 1000) {
+                datalog_file_outstream.flush();
+                r36sFlushClock.restart();
+            }
+            r36sCsvLiveRow(r36sRow);   // R36S
         }
     }
 }
@@ -2287,6 +2305,882 @@ QString r36sSetValueDialog(QWidget *parent, QTableWidget *table, bool *ok)
     return accepted ? dlg.result() : QString();
 }
 
+// ===== R36S CSV viewer (desktop 2) =====
+// Newest log opens by itself. While "Log to file" records, rows arrive straight from
+// log_to_file (no waiting for the card), the newest row sits on the centre marker and the
+// graphs scroll; only the rows in view are kept. When the recording stops, the finished log
+// is read back from the card in full. Each graph side (A left, B right) is scaled to the whole log's min/max,
+// so it never changes while you move or zoom; live, it only widens when a new extreme arrives.
+// Keys: up/down list, left/right move (hold = faster), Enter (Y) or a click (A) = pick graph
+// for the highlighted value, Space (Select) = older logs, +/- (R2/L2) = zoom, Esc (B) = close.
+#include <QPainter>
+#include <QMouseEvent>
+#include <QFileInfo>
+#include <QMap>
+#include <QPointer>
+#include <cfloat>
+#include <functional>
+
+struct R36SCsvData
+{
+    QString path;
+    QStringList names;                 // columns after Time
+    QVector<double> time;
+    QVector<QVector<float> > cols;
+    QVector<float> lo, hi;             // whole-log min/max per column
+    QVector<int> dec;                  // decimals seen per column
+    double t0 = 0;                     // time of the first row (kept when old rows are dropped)
+
+    void clear() { path.clear(); names.clear(); time.clear(); cols.clear(); lo.clear(); hi.clear(); dec.clear(); t0 = 0; }
+
+    // Live: drop the oldest rows, keeping the min/max already seen
+    int trimTo(int keep)
+    {
+        int drop = rows() - keep;
+        if (drop <= 0)
+            return 0;
+        time.remove(0, drop);
+        for (QVector<float> &c : cols)
+            c.remove(0, drop);
+        return drop;
+    }
+    int rows() const { return time.size(); }
+
+    void setNames(const QStringList &header)   // header starts with Time
+    {
+        names.clear();
+        for (int i = 1; i < header.size(); i++)
+        {
+            QString n = header.at(i).trimmed();
+            if (!n.isEmpty())
+                names << n;
+        }
+        time.clear();
+        cols = QVector<QVector<float> >(names.size());
+        lo = QVector<float>(names.size(), FLT_MAX);
+        hi = QVector<float>(names.size(), -FLT_MAX);
+        dec = QVector<int>(names.size(), 0);
+    }
+
+    void addRow(const QStringList &f)          // f starts with Time
+    {
+        if (f.isEmpty() || names.isEmpty())
+            return;
+        bool ok = false;
+        double t = f.at(0).trimmed().toDouble(&ok);
+        if (!ok)
+            return;
+        if (time.isEmpty() && t0 == 0)
+            t0 = t;
+        time.append(t);
+        for (int k = 0; k < names.size(); k++)
+        {
+            QString s = k + 1 < f.size() ? f.at(k + 1).trimmed() : QString();
+            float v = s.toFloat(&ok);
+            if (!ok)
+                v = cols[k].isEmpty() ? 0.0f : cols[k].last();   // "--" or missing: repeat last
+            else
+            {
+                int dot = s.indexOf('.');
+                if (dot >= 0)
+                    dec[k] = qMax(dec[k], qMin(3, s.length() - dot - 1));
+                lo[k] = qMin(lo[k], v);
+                hi[k] = qMax(hi[k], v);
+            }
+            cols[k].append(v);
+        }
+    }
+};
+
+static bool r36sCsvLoad(const QString &path, R36SCsvData &d)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return false;
+    d.clear();
+    d.path = path;
+    d.setNames(QString::fromLatin1(f.readLine()).trimmed().split(','));
+    while (!f.atEnd())
+    {
+        QString line = QString::fromLatin1(f.readLine()).trimmed();
+        if (!line.isEmpty())
+            d.addRow(line.split(','));
+    }
+    return true;
+}
+
+static R36SCsvData r36sCsvLive;                 // the recording in progress (or the last one)
+static QElapsedTimer r36sCsvLiveClock;          // time since the last live row
+static int r36sCsvLiveKeep = 600;               // rows kept while live (the viewer's window)
+static QHash<QString, QPair<int, char> > r36sCsvPicks;   // graph/side picked by hand, by column name
+
+static bool r36sCsvLiveActive()
+{
+    return r36sCsvLiveClock.isValid() && r36sCsvLiveClock.elapsed() < 1500;   // no row for 1.5 s = stopped
+}
+
+// Every fastecu_*.csv, newest first (the date is in the name)
+static QStringList r36sCsvLogList()
+{
+    QStringList dirs;
+    dirs << R36S_FILES_DIR + "datalogs";
+    if (!r36sCsvLive.path.isEmpty())
+        dirs << QFileInfo(r36sCsvLive.path).absolutePath();
+    QMap<QString, QString> byName;
+    for (const QString &dir : dirs)
+    {
+        QDir d(dir);
+        for (const QString &f : d.entryList(QStringList() << "fastecu_*.csv", QDir::Files))
+            if (!byName.contains(f))
+                byName.insert(f, d.filePath(f));
+    }
+    QStringList out;
+    for (auto it = byName.constEnd(); it != byName.constBegin();)
+    {
+        --it;
+        out << it.value();
+    }
+    return out;
+}
+
+// Names on the display = ... lines of log_setup.txt, in order
+static QStringList r36sCsvDisplayNames()
+{
+    QStringList out;
+    QFile f(R36S_FILES_DIR + "log_setup.txt");
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return out;
+    while (!f.atEnd())
+    {
+        QString line = QString::fromUtf8(f.readLine()).trimmed();
+        if (line.startsWith('#') || !line.contains('='))
+            continue;
+        if (line.section('=', 0, 0).trimmed().toLower() == "display")
+            out << line.section('=', 1).trimmed();
+    }
+    return out;
+}
+
+static QColor r36sCsvColor(int k)
+{
+    static const char *c[] = { "#1f6fd1", "#d1495b", "#2a9d4b", "#7b4fc9", "#e07b00", "#0f8b8d",
+                               "#c2185b", "#5d6d1e", "#8d5524", "#3949ab", "#00897b", "#6d4c41" };
+    return QColor(c[k % 12]);
+}
+
+// A plain widget that hands its painting and clicks to a callback
+class R36SPaintBox : public QWidget
+{
+public:
+    std::function<void(QPainter &, const QRect &)> onPaint;
+    std::function<void(const QPoint &)> onClick;
+    explicit R36SPaintBox(QWidget *parent) : QWidget(parent) { setFocusPolicy(Qt::NoFocus); }
+protected:
+    void paintEvent(QPaintEvent *) override { QPainter p(this); if (onPaint) onPaint(p, rect()); }
+    void mousePressEvent(QMouseEvent *e) override { if (e->button() == Qt::LeftButton && onClick) onClick(e->pos()); }
+};
+
+class R36SCsvViewer : public QWidget
+{
+public:
+    explicit R36SCsvViewer(QWidget *parent) : QWidget(parent)
+    {
+        setFocusPolicy(Qt::StrongFocus);
+        QVBoxLayout *layout = new QVBoxLayout(this);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(0);
+        top = new QLabel(this);
+        top->setTextFormat(Qt::RichText);
+        top->setContentsMargins(6, 3, 6, 3);
+        layout->addWidget(top);
+        split = new QSplitter(Qt::Horizontal, this);
+        split->setHandleWidth(10);              // wide enough to grab with the stick cursor
+        split->setChildrenCollapsible(false);
+        list = new R36SPaintBox(split);
+        graphs = new R36SPaintBox(split);
+        list->setMinimumWidth(90);
+        graphs->setMinimumWidth(160);
+        split->addWidget(list);
+        split->addWidget(graphs);
+        split->setStretchFactor(1, 1);
+        split->setSizes(QList<int>() << 200 << 440);
+        layout->addWidget(split, 1);
+        overlay = new R36SPaintBox(this);
+        overlay->hide();
+
+        list->onPaint = [this](QPainter &p, const QRect &r) { paintList(p, r); };
+        graphs->onPaint = [this](QPainter &p, const QRect &r) { paintGraphs(p, r); };
+        overlay->onPaint = [this](QPainter &p, const QRect &r) { paintOverlay(p, r); };
+        list->onClick = [this](const QPoint &pt) {
+            int k = listTop + pt.y() / rowHeight();
+            if (k >= 0 && k < data().names.size()) { sel = k; openPicker(); }
+        };
+        graphs->onClick = [this](const QPoint &) { openPicker(); };
+        overlay->onClick = [this](const QPoint &pt) { overlayClick(pt); };
+
+        statusTimer = new QTimer(this);
+        statusTimer->setInterval(1000);
+        connect(statusTimer, &QTimer::timeout, this, [this]() { if (usingLive) finishLive(); });
+    }
+
+    // A new recording started (called from r36sCsvLiveStart)
+    void liveStarted()
+    {
+        lastNewest = r36sCsvLive.path;
+        if (pinned)
+            return;
+        usingLive = true;
+        follow = true;
+        win = 600;      // about 30 s at 20 rows a second
+        pos = 0;
+        pickMode = 0;
+        applyAssignments();
+        updateAll();
+    }
+
+    // A live row arrived (called from r36sCsvLiveRow)
+    void liveRowAdded(int dropped)
+    {
+        if (!usingLive)
+        {
+            // the same recording carried on after a pause: go back to following it
+            if (!pinned && QFileInfo(file.path).fileName() == QFileInfo(r36sCsvLive.path).fileName())
+            {
+                usingLive = true;
+                follow = true;
+                win = 600;
+                applyAssignments();
+            }
+            else
+                return;
+        }
+        pos -= dropped;
+        clampPos();
+        if (follow)
+            pos = data().rows() - 1;
+        if (!repaintPending && isVisible())
+        {
+            repaintPending = true;
+            QTimer::singleShot(100, this, [this]() { repaintPending = false; updateAll(); });
+        }
+    }
+
+protected:
+    // Recording stopped: read the finished log from the card, whole drive on screen
+    void finishLive()
+    {
+        if (!usingLive || r36sCsvLiveActive())
+        {
+            updateAll();
+            return;
+        }
+        QString path = r36sCsvLive.path;
+        lastNewest = path;
+        pinned = false;
+        openLog(path);
+        updateAll();
+    }
+
+    void showEvent(QShowEvent *e) override
+    {
+        QWidget::showEvent(e);
+        refresh();
+        statusTimer->start();
+    }
+
+    void hideEvent(QHideEvent *e) override
+    {
+        statusTimer->stop();
+        QWidget::hideEvent(e);
+    }
+
+    void resizeEvent(QResizeEvent *e) override
+    {
+        QWidget::resizeEvent(e);
+        overlay->setGeometry(rect());
+    }
+
+    void keyPressEvent(QKeyEvent *e) override
+    {
+        const int key = e->key();
+        const bool enter = key == Qt::Key_Return || key == Qt::Key_Enter;
+        const int n = data().names.size();
+        if (pickMode == 1)   // graph / side picker
+        {
+            if (key == Qt::Key_Left)       pickGraph = qMax(0, pickGraph - 1);
+            else if (key == Qt::Key_Right) pickGraph = qMin(4, pickGraph + 1);
+            else if (key == Qt::Key_Up)    pickSide = 'A';
+            else if (key == Qt::Key_Down)  pickSide = 'B';
+            else if (enter)                applyPicker();
+            else if (key == Qt::Key_Escape) pickMode = 0;
+            else return QWidget::keyPressEvent(e);
+            updateAll();
+            return;
+        }
+        if (pickMode == 2)   // log list
+        {
+            if (key == Qt::Key_Up)        logSel = qMax(0, logSel - 1);
+            else if (key == Qt::Key_Down) logSel = qMin(logs.size() - 1, logSel + 1);
+            else if (enter)               openFromList(logSel);
+            else if (key == Qt::Key_Escape || key == Qt::Key_Space) pickMode = 0;
+            else return QWidget::keyPressEvent(e);
+            updateAll();
+            return;
+        }
+        if (key == Qt::Key_Up)                    sel = qMax(0, sel - 1);
+        else if (key == Qt::Key_Down)             sel = qMin(n - 1, sel + 1);
+        else if (key == Qt::Key_Left || key == Qt::Key_Right)
+        {
+            repeats = e->isAutoRepeat() ? repeats + 1 : 0;
+            int step = qMax(1, win / (repeats > 8 ? 20 : 100));
+            pos += key == Qt::Key_Left ? -step : step;
+            clampPos();
+            follow = usingLive && pos >= data().rows() - 1;
+        }
+        else if (enter)                           openPicker();
+        else if (key == Qt::Key_Space)            openLogList();
+        else if (key == Qt::Key_Plus || key == Qt::Key_Equal || key == Qt::Key_PageUp)
+            zoom(1.0 / 1.5);
+        else if (key == Qt::Key_Minus || key == Qt::Key_PageDown)
+            zoom(1.5);
+        else
+            return QWidget::keyPressEvent(e);
+        updateAll();
+    }
+
+private:
+    R36SCsvData file;            // a log read from the card
+    bool usingLive = false;      // showing r36sCsvLive instead of file
+    bool pinned = false;         // an older log was picked by hand: don't jump to the newest
+    bool follow = false;         // live: keep the newest row on the marker
+    bool repaintPending = false;
+    QString lastNewest;
+    int sel = 0, pos = 0, win = 600, listTop = 0, repeats = 0;
+    QVector<int> graph;          // per column: 0 = not shown, 1-4 = graph
+    QVector<char> side;          // per column: 'A' or 'B'
+    int pickMode = 0;            // 0 none, 1 graph picker, 2 log list
+    int pickGraph = 1;
+    char pickSide = 'A';
+    QStringList logs;
+    int logSel = 0, logTop = 0;
+    QRect panel;
+    QList<QPair<QRect, int> > hits;
+    QLabel *top;
+    QSplitter *split;
+    R36SPaintBox *list, *graphs, *overlay;
+    QTimer *statusTimer;
+
+    const R36SCsvData &data() const { return usingLive ? r36sCsvLive : file; }
+    int rowHeight() const { return fontMetrics().height() + 6; }
+    void clampPos() { pos = qBound(0, pos, qMax(0, data().rows() - 1)); }
+
+    void zoom(double f)
+    {
+        int rows = data().rows();
+        win = qBound(20, int(win * f + 0.5), usingLive ? 6000 : qMax(40, rows * 2));
+        if (usingLive)
+            r36sCsvLiveKeep = win;
+        if (follow)
+            pos = rows - 1;
+    }
+
+    void refresh()
+    {
+        if (r36sCsvLiveActive() && !pinned)
+        {
+            if (!usingLive)
+            {
+                usingLive = true;
+                win = 600;
+                applyAssignments();
+            }
+            follow = true;
+            pos = data().rows() - 1;
+            clampPos();
+            updateAll();
+            return;
+        }
+        if (usingLive)
+        {
+            finishLive();
+            return;
+        }
+        QStringList all = r36sCsvLogList();
+        QString newest = all.value(0);
+        if (!pinned && !newest.isEmpty() && newest != lastNewest)
+        {
+            lastNewest = newest;
+            openLog(newest);
+        }
+        updateAll();
+    }
+
+    void openLog(const QString &path)
+    {
+        r36sCsvLoad(path, file);
+        usingLive = false;
+        follow = false;
+        int rows = file.rows();
+        win = qMax(20, rows);        // whole log on screen first
+        pos = rows / 2;
+        applyAssignments();
+    }
+
+    void openFromList(int i)
+    {
+        QString path = logs.value(i);
+        pickMode = 0;
+        if (path.isEmpty())
+            return;
+        bool isLive = r36sCsvLiveActive() &&
+                      QFileInfo(r36sCsvLive.path).fileName() == QFileInfo(path).fileName();
+        pinned = i != 0 && !isLive;
+        if (isLive)
+        {
+            usingLive = true;
+            follow = true;
+            win = 600;
+            applyAssignments();
+            pos = data().rows() - 1;
+        }
+        else
+            openLog(path);
+        lastNewest = logs.value(0);
+    }
+
+    // Display values first (2 per graph, A then B), then anything picked by hand this session
+    void applyAssignments()
+    {
+        const R36SCsvData &d = data();
+        int n = d.names.size();
+        graph = QVector<int>(n, 0);
+        side = QVector<char>(n, 'A');
+        QList<int> show;
+        for (const QString &want : r36sCsvDisplayNames())
+            for (int k = 0; k < n; k++)
+                if (!show.contains(k) && d.names.at(k).compare(want, Qt::CaseInsensitive) == 0)
+                    show << k;
+        if (show.isEmpty())   // names not matched (IDs in log_setup.txt): display values are written first
+        {
+            int count = r36sDisplayIds.isEmpty() ? 6 : r36sDisplayIds.size();
+            for (int k = 0; k < n && k < count; k++)
+                show << k;
+        }
+        for (int i = 0; i < show.size() && i < 6; i++)
+        {
+            graph[show.at(i)] = i / 2 + 1;
+            side[show.at(i)] = (i % 2) ? 'B' : 'A';
+        }
+        for (int k = 0; k < n; k++)
+        {
+            auto it = r36sCsvPicks.constFind(d.names.at(k));
+            if (it != r36sCsvPicks.constEnd())
+            {
+                graph[k] = it.value().first;
+                side[k] = it.value().second;
+            }
+        }
+        sel = qBound(0, sel, qMax(0, n - 1));
+    }
+
+    void openPicker()
+    {
+        if (data().names.isEmpty())
+            return;
+        pickGraph = graph.value(sel) ? graph.value(sel) : 1;
+        pickSide = side.value(sel, 'A');
+        pickMode = 1;
+        updateAll();
+    }
+
+    void applyPicker()
+    {
+        if (sel >= 0 && sel < graph.size())
+        {
+            graph[sel] = pickGraph;
+            side[sel] = pickSide;
+            r36sCsvPicks.insert(data().names.at(sel), qMakePair(pickGraph, pickSide));
+        }
+        pickMode = 0;
+    }
+
+    void openLogList()
+    {
+        logs = r36sCsvLogList();
+        if (logs.isEmpty())
+            return;
+        logSel = 0;
+        for (int i = 0; i < logs.size(); i++)
+            if (QFileInfo(logs.at(i)).fileName() == QFileInfo(data().path).fileName())
+                logSel = i;
+        pickMode = 2;
+        updateAll();
+    }
+
+    QString valueText(int k) const
+    {
+        const R36SCsvData &d = data();
+        if (d.rows() == 0 || k < 0 || k >= d.cols.size())
+            return "--";
+        return QString::number(d.cols.at(k).at(qBound(0, pos, d.rows() - 1)), 'f', d.dec.at(k));
+    }
+
+    void updateAll()
+    {
+        const R36SCsvData &d = data();
+        QString name = d.path.isEmpty() ? QString("No logs in %1datalogs").arg(R36S_FILES_DIR)
+                                        : QFileInfo(d.path).fileName();
+        QString text = name.toHtmlEscaped();
+        if (d.rows() > 1)
+        {
+            double t0 = d.t0, span = d.time.last() - t0;
+            double secsPerRow = (d.time.last() - d.time.first()) / (d.rows() - 1);
+            text += QString("&nbsp;&nbsp;&middot;&nbsp;&nbsp;%1 s of %2 s&nbsp;&nbsp;&middot;&nbsp;&nbsp;window %3 s")
+                        .arg(d.time.at(qBound(0, pos, d.rows() - 1)) - t0, 0, 'f', 1)
+                        .arg(span, 0, 'f', 1)
+                        .arg(win * secsPerRow, 0, 'f', 0);
+        }
+        if (usingLive)
+            text += r36sCsvLiveActive() ? "&nbsp;&nbsp;<b style=\"color:#1a8f3c\">LIVE</b>"
+                                        : "&nbsp;&nbsp;(recording stopped)";
+        top->setText(text);
+        overlay->setVisible(pickMode != 0);
+        overlay->raise();
+        list->update();
+        graphs->update();
+        overlay->update();
+    }
+
+    void paintList(QPainter &p, const QRect &r)
+    {
+        const R36SCsvData &d = data();
+        p.fillRect(r, palette().base());
+        QFontMetrics fm(font());
+        int rh = rowHeight();
+        int visible = qMax(1, r.height() / rh);
+        if (sel < listTop) listTop = sel;
+        if (sel >= listTop + visible) listTop = sel - visible + 1;
+        listTop = qMax(0, listTop);
+        int tagW = fm.horizontalAdvance("4B") + 8;
+        for (int i = 0; i < visible && listTop + i < d.names.size(); i++)
+        {
+            int k = listTop + i;
+            QRect row(r.x(), r.y() + i * rh, r.width(), rh);
+            bool on = k == sel;
+            if (on)
+                p.fillRect(row, palette().highlight());
+            QColor ink = on ? palette().highlightedText().color() : palette().text().color();
+            QRect box(row.x() + 5, row.y() + (rh - 10) / 2, 10, 10);
+            if (graph.value(k))
+                p.fillRect(box, r36sCsvColor(k));
+            else
+            {
+                p.setPen(ink);
+                p.drawRect(box.adjusted(0, 0, -1, -1));
+            }
+            QRect tag(row.right() - tagW, row.y(), tagW - 4, rh);
+            if (graph.value(k))
+            {
+                p.setPen(ink);
+                p.drawText(tag, Qt::AlignVCenter | Qt::AlignRight, QString("%1%2").arg(graph.value(k)).arg(side.value(k)));
+            }
+            QString val = valueText(k);
+            int valW = fm.horizontalAdvance(val) + 8;
+            QRect valR(tag.left() - valW, row.y(), valW, rh);
+            p.setPen(ink);
+            p.drawText(valR, Qt::AlignVCenter | Qt::AlignRight, val);
+            QRect nameR(box.right() + 6, row.y(), valR.left() - box.right() - 8, rh);
+            p.drawText(nameR, Qt::AlignVCenter | Qt::AlignLeft, fm.elidedText(d.names.at(k), Qt::ElideRight, nameR.width()));
+        }
+    }
+
+    void paintGraphs(QPainter &p, const QRect &r)
+    {
+        const R36SCsvData &d = data();
+        p.fillRect(r, palette().base());
+        QFont small = font();
+        small.setPointSizeF(qMax(6.0, small.pointSizeF() - 1));
+        p.setFont(small);
+        QFontMetrics sfm(small);
+        if (d.rows() == 0)
+        {
+            p.setPen(palette().text().color());
+            p.drawText(r, Qt::AlignCenter, d.names.isEmpty() ? "No log loaded" : "Waiting for data");
+            return;
+        }
+        int G = 1;
+        for (int g : graph)
+            G = qMax(G, g);
+        const int L = sfm.horizontalAdvance("-00000") + 6, R = L, hh = sfm.height() + 4;
+        const int rows = d.rows(), a = pos - win / 2;
+        const int gh = r.height() / G;
+        for (int g = 1; g <= G; g++)
+        {
+            int y0 = r.y() + (g - 1) * gh;
+            QRect box(r.x(), y0, r.width(), g == G ? r.bottom() - y0 + 1 : gh);
+            QRect head(box.x(), box.y(), box.width(), hh);
+            QRect plot(box.x() + L, box.y() + hh + 2, box.width() - L - R, box.height() - hh - 6);
+            if (g > 1)
+            {
+                p.setPen(palette().mid().color());
+                p.drawLine(box.left(), box.top(), box.right(), box.top());
+            }
+            if (plot.width() < 10 || plot.height() < 10)
+                continue;
+            p.setPen(palette().mid().color());
+            p.drawRect(plot.adjusted(0, 0, -1, -1));
+            p.drawLine(plot.left(), plot.center().y(), plot.right(), plot.center().y());
+
+            QList<int> ks;
+            for (int pass = 0; pass < 2; pass++)
+                for (int k = 0; k < graph.size(); k++)
+                    if (graph.at(k) == g && side.at(k) == (pass ? 'B' : 'A'))
+                        ks << k;
+            if (ks.isEmpty())
+            {
+                p.setPen(palette().mid().color());
+                p.drawText(head.adjusted(L, 0, 0, 0), Qt::AlignVCenter | Qt::AlignLeft, QString("Graph %1: empty").arg(g));
+                continue;
+            }
+            // header: side, name and the value at the marker, in the line's colour
+            int itemW = (head.width() - 8) / ks.size();
+            for (int i = 0; i < ks.size(); i++)
+            {
+                int k = ks.at(i);
+                bool isB = side.at(k) == 'B';
+                QString pre = QString("%1: ").arg(side.at(k)), val = " " + valueText(k);
+                int nameW = itemW - sfm.horizontalAdvance(pre + val) - 8;
+                QString txt = pre + sfm.elidedText(d.names.at(k), Qt::ElideRight, qMax(10, nameW)) + val;
+                p.setPen(r36sCsvColor(k));
+                // A values from the left (their scale is on the left), B values from the right
+                QRect cell(head.x() + 4 + i * itemW, head.y(), itemW, head.height());
+                p.drawText(cell, Qt::AlignVCenter | (isB ? Qt::AlignRight : Qt::AlignLeft), txt);
+            }
+            for (char s : { 'A', 'B' })
+            {
+                float lo = FLT_MAX, hi = -FLT_MAX;
+                int first = -1, decs = 0;
+                for (int k : ks)
+                    if (side.at(k) == s)
+                    {
+                        if (first < 0) first = k;
+                        lo = qMin(lo, d.lo.at(k));
+                        hi = qMax(hi, d.hi.at(k));
+                        decs = qMax(decs, d.dec.at(k));
+                    }
+                if (first < 0)
+                    continue;
+                if (lo > hi) { lo = 0; hi = 1; }
+                if (hi - lo < 1e-6f) { hi += 1; lo -= 1; }
+                float pad = (hi - lo) * 0.05f;
+                lo -= pad;
+                hi += pad;
+                // scale labels: top, middle, bottom
+                p.setPen(r36sCsvColor(first));
+                int ld = qMin(decs, 1);
+                QRect lab = s == 'A' ? QRect(box.x(), plot.y(), L - 4, plot.height())
+                                     : QRect(plot.right() + 4, plot.y(), R - 4, plot.height());
+                Qt::Alignment h = s == 'A' ? Qt::AlignRight : Qt::AlignLeft;
+                p.drawText(lab, h | Qt::AlignTop, QString::number(hi, 'f', ld));
+                p.drawText(lab, h | Qt::AlignVCenter, QString::number((hi + lo) / 2, 'f', ld));
+                p.drawText(lab, h | Qt::AlignBottom, QString::number(lo, 'f', ld));
+                // lines
+                p.setClipRect(plot.adjusted(1, 1, -1, -1));
+                const int i0 = qMax(0, a), i1 = qMin(rows - 1, a + win);
+                const double xs = double(plot.width() - 1) / win, ys = double(plot.height() - 1) / (hi - lo);
+                for (int k : ks)
+                {
+                    if (side.at(k) != s || i1 < i0)
+                        continue;
+                    const QVector<float> &c = d.cols.at(k);
+                    QPolygonF line;
+                    if (i1 - i0 <= plot.width() * 2)
+                        for (int i = i0; i <= i1; i++)
+                            line << QPointF(plot.x() + (i - a) * xs, plot.bottom() - (c.at(i) - lo) * ys);
+                    else   // more rows than pixels: min and max per pixel column
+                    {
+                        int px = -1;
+                        float mn = 0, mx = 0;
+                        for (int i = i0; i <= i1 + 1; i++)
+                        {
+                            int x = i <= i1 ? int(plot.x() + (i - a) * xs) : -2;
+                            if (x != px)
+                            {
+                                if (px >= 0)
+                                    line << QPointF(px, plot.bottom() - (mn - lo) * ys)
+                                         << QPointF(px, plot.bottom() - (mx - lo) * ys);
+                                if (i > i1)
+                                    break;
+                                px = x;
+                                mn = mx = c.at(i);
+                            }
+                            else
+                            {
+                                mn = qMin(mn, c.at(i));
+                                mx = qMax(mx, c.at(i));
+                            }
+                        }
+                    }
+                    p.setPen(QPen(r36sCsvColor(k), 1.5));
+                    p.drawPolyline(line);
+                }
+                p.setClipping(false);
+            }
+        }
+        // centre marker: the values in the list and the headers are read here
+        int mx = r.x() + L + (r.width() - L - R) / 2;
+        QPen dash(palette().text().color(), 1, Qt::DashLine);
+        p.setPen(dash);
+        p.drawLine(mx, r.top(), mx, r.bottom());
+    }
+
+    void drawOption(QPainter &p, const QRect &b, const QString &text, bool on, int id)
+    {
+        if (on)
+        {
+            p.fillRect(b, palette().highlight());
+            p.setPen(palette().highlightedText().color());
+        }
+        else
+        {
+            p.setPen(palette().mid().color());
+            p.drawRect(b.adjusted(0, 0, -1, -1));
+            p.setPen(palette().text().color());
+        }
+        p.drawText(b, Qt::AlignCenter, text);
+        hits << qMakePair(b, id);
+    }
+
+    void paintOverlay(QPainter &p, const QRect &r)
+    {
+        hits.clear();
+        p.fillRect(r, QColor(0, 0, 0, 70));
+        QFontMetrics fm(font());
+        int lh = fm.height() + 10;
+        if (pickMode == 1)
+        {
+            int w = qMin(r.width() - 20, 360), h = lh * 5 + 12;
+            panel = QRect(r.center().x() - w / 2, r.center().y() - h / 2, w, h);
+            p.fillRect(panel, palette().window());
+            p.setPen(palette().dark().color());
+            p.drawRect(panel.adjusted(0, 0, -1, -1));
+            QRect line(panel.x() + 10, panel.y() + 6, w - 20, lh);
+            p.setPen(palette().text().color());
+            p.drawText(line, Qt::AlignVCenter | Qt::AlignLeft, fm.elidedText(data().names.value(sel), Qt::ElideRight, line.width()));
+            int bx = line.x() + fm.horizontalAdvance("Scale") + 12;
+            line.translate(0, lh);
+            p.setPen(palette().text().color());
+            p.drawText(line, Qt::AlignVCenter | Qt::AlignLeft, "Graph");
+            int bw = (line.right() - bx) / 5;
+            for (int g = 0; g <= 4; g++)
+                drawOption(p, QRect(bx + g * bw, line.y() + 2, bw - 4, lh - 4), g ? QString::number(g) : "Off", pickGraph == g, g);
+            line.translate(0, lh);
+            p.setPen(palette().text().color());
+            p.drawText(line, Qt::AlignVCenter | Qt::AlignLeft, "Scale");
+            bw = (line.right() - bx) / 2;
+            drawOption(p, QRect(bx, line.y() + 2, bw - 4, lh - 4), "A  left", pickSide == 'A', 10);
+            drawOption(p, QRect(bx + bw, line.y() + 2, bw - 4, lh - 4), "B  right", pickSide == 'B', 11);
+            line.translate(0, lh);
+            int half = (line.width() - 4) / 2;
+            drawOption(p, QRect(line.x(), line.y() + 2, half, lh - 4), "Apply", false, 20);
+            drawOption(p, QRect(line.x() + half + 4, line.y() + 2, half, lh - 4), "Cancel", false, 21);
+            line.translate(0, lh);
+            p.setPen(palette().dark().color());
+            p.drawText(line, Qt::AlignVCenter | Qt::AlignLeft, "D-pad: choose   Y: apply   B: cancel");
+        }
+        else if (pickMode == 2)
+        {
+            panel = r.adjusted(20, 20, -20, -20);
+            p.fillRect(panel, palette().window());
+            p.setPen(palette().dark().color());
+            p.drawRect(panel.adjusted(0, 0, -1, -1));
+            QRect line(panel.x() + 10, panel.y() + 4, panel.width() - 20, lh);
+            p.setPen(palette().text().color());
+            p.drawText(line, Qt::AlignVCenter | Qt::AlignLeft, "Logs, newest first");
+            int visible = qMax(1, (panel.height() - 2 * lh - 8) / lh);
+            if (logSel < logTop) logTop = logSel;
+            if (logSel >= logTop + visible) logTop = logSel - visible + 1;
+            for (int i = 0; i < visible && logTop + i < logs.size(); i++)
+            {
+                int j = logTop + i;
+                QRect row(line.x(), line.y() + (i + 1) * lh, line.width(), lh);
+                QFileInfo fi(logs.at(j));
+                bool live = r36sCsvLiveActive() && fi.fileName() == QFileInfo(r36sCsvLive.path).fileName();
+                QString text = fi.fileName() + (live ? "   (recording)" : QString("   %1 KB").arg((fi.size() + 1023) / 1024));
+                if (j == logSel)
+                {
+                    p.fillRect(row, palette().highlight());
+                    p.setPen(palette().highlightedText().color());
+                }
+                else
+                    p.setPen(palette().text().color());
+                p.drawText(row.adjusted(6, 0, -6, 0), Qt::AlignVCenter | Qt::AlignLeft, text);
+                hits << qMakePair(row, 100 + j);
+            }
+            p.setPen(palette().dark().color());
+            p.drawText(QRect(line.x(), panel.bottom() - lh, line.width(), lh), Qt::AlignVCenter | Qt::AlignLeft,
+                       "Up/down: choose   Y: open   B: close");
+        }
+    }
+
+    void overlayClick(const QPoint &pt)
+    {
+        for (const auto &h : hits)
+            if (h.first.contains(pt))
+            {
+                int id = h.second;
+                if (id <= 4)        pickGraph = id;
+                else if (id == 10)  pickSide = 'A';
+                else if (id == 11)  pickSide = 'B';
+                else if (id == 20)  applyPicker();
+                else if (id == 21)  pickMode = 0;
+                else if (id >= 100) openFromList(id - 100);
+                updateAll();
+                return;
+            }
+        if (!panel.contains(pt))   // A pressed with the cursor away from the box: act on the highlighted choice
+        {
+            if (pickMode == 1)
+                applyPicker();
+            else if (pickMode == 2)
+                openFromList(logSel);
+            updateAll();
+        }
+    }
+};
+
+static QPointer<R36SCsvViewer> r36sCsvViewer;
+
+static QWidget *r36sCsvViewerCreate(QWidget *parent)
+{
+    r36sCsvViewer = new R36SCsvViewer(parent);
+    return r36sCsvViewer;
+}
+
+// Called from log_to_file when a new CSV is opened (header starts with Time)
+void r36sCsvLiveStart(const QString &path, const QStringList &header)
+{
+    r36sCsvLive.clear();
+    r36sCsvLive.path = path;
+    r36sCsvLive.setNames(header);
+    r36sCsvLiveKeep = 600;
+    r36sCsvLiveClock.start();
+    if (r36sCsvViewer)
+        r36sCsvViewer->liveStarted();
+}
+
+// Called from log_to_file for every row written to the CSV
+void r36sCsvLiveRow(const QStringList &row)
+{
+    if (r36sCsvLive.names.isEmpty())
+        return;
+    r36sCsvLive.addRow(row);
+    int dropped = r36sCsvLive.rows() > r36sCsvLiveKeep + 200 ? r36sCsvLive.trimTo(r36sCsvLiveKeep) : 0;
+    r36sCsvLiveClock.restart();
+    if (r36sCsvViewer)
+        r36sCsvViewer->liveRowAdded(dropped);
+}
+// ===== end R36S CSV viewer =====
 
 // ===== R36S desktops (L1 / R1) =====
 // L1 and R1 send Shift+Tab and Tab. On the FastECU screen and on the other desktops they
@@ -2335,14 +3229,15 @@ static QWidget *r36sDesktopOverlay()
         w->setWindowTitle("FastECU desktops");
         w->setAttribute(Qt::WA_QuitOnClose, false);
         w->setFocusPolicy(Qt::StrongFocus);
-        w->setStyleSheet("QWidget#r36sDesktops { background-color: #202428; } QLabel { color: white; }");
+        w->setAutoFillBackground(true);   // FastECU's own colours
         QVBoxLayout *layout = new QVBoxLayout(w);
         layout->setContentsMargins(0, 0, 0, 0);
         QStackedWidget *stack = new QStackedWidget(w);
         for (int i = 1; i < R36S_DESKTOP_COUNT; i++)
         {
-            QWidget *page = new QWidget(stack);
-            r36sDesktopBuild(i, page);
+            QWidget *page = i == 1 ? r36sCsvViewerCreate(stack) : new QWidget(stack);   // desktop 2 = CSV viewer
+            if (i != 1)
+                r36sDesktopBuild(i, page);
             stack->addWidget(page);
         }
         layout->addWidget(stack);
@@ -2382,6 +3277,7 @@ static void r36sDesktopShow(int current, int index)
     }
     QWidget *overlay = r36sDesktopOverlay();
     r36sDeskStack->setCurrentIndex(index - 1);   // flip the page in place
+    r36sDeskStack->currentWidget()->setFocus();   // keys go to that desktop
     if (current == 0)
     {
         overlay->setGeometry(win->geometry());   // same place and size as FastECU (full screen on the R36S)
@@ -2389,7 +3285,7 @@ static void r36sDesktopShow(int current, int index)
             overlay->show();                     // only the first time
         overlay->raise();
         overlay->activateWindow();
-        overlay->setFocus();
+        r36sDeskStack->currentWidget()->setFocus();
     }
 }
 
@@ -2430,5 +3326,7 @@ void r36sDesktopsInstall(QMainWindow *win)
     qApp->installEventFilter(new R36SDesktopSwitcher(win));
 }
 // ===== end R36S desktops =====
+
+
 // ===== end R36S Set value window =====
 
