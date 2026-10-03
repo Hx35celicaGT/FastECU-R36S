@@ -2412,7 +2412,8 @@ static bool r36sCsvLoad(const QString &path, R36SCsvData &d)
 static R36SCsvData r36sCsvLive;                 // the recording in progress (or the last one)
 static QElapsedTimer r36sCsvLiveClock;          // time since the last live row
 static int r36sCsvLiveKeep = 600;               // rows kept while live (the viewer's window)
-static QHash<QString, QPair<int, char> > r36sCsvPicks;   // graph/side picked by hand, by column name
+struct R36SCsvPick { int graph; char side; int color; };
+static QHash<QString, R36SCsvPick> r36sCsvPicks;   // graph/side/colour picked by hand, by column name
 
 static bool r36sCsvLiveActive()
 {
@@ -2461,11 +2462,12 @@ static QStringList r36sCsvDisplayNames()
     return out;
 }
 
-static QColor r36sCsvColor(int k)
+// The 6 line colours offered in the picker (all readable on FastECU's light background)
+static const int R36S_CSV_COLORS = 6;
+static QColor r36sCsvColor(int c)
 {
-    static const char *c[] = { "#1f6fd1", "#d1495b", "#2a9d4b", "#7b4fc9", "#e07b00", "#0f8b8d",
-                               "#c2185b", "#5d6d1e", "#8d5524", "#3949ab", "#00897b", "#6d4c41" };
-    return QColor(c[k % 12]);
+    static const char *col[R36S_CSV_COLORS] = { "#1f6fd1", "#d1495b", "#2a9d4b", "#e07b00", "#7b4fc9", "#0f8b8d" };
+    return QColor(col[((c % R36S_CSV_COLORS) + R36S_CSV_COLORS) % R36S_CSV_COLORS]);
 }
 
 // A plain widget that hands its painting and clicks to a callback
@@ -2511,12 +2513,10 @@ public:
         list->onPaint = [this](QPainter &p, const QRect &r) { paintList(p, r); };
         graphs->onPaint = [this](QPainter &p, const QRect &r) { paintGraphs(p, r); };
         overlay->onPaint = [this](QPainter &p, const QRect &r) { paintOverlay(p, r); };
-        list->onClick = [this](const QPoint &pt) {
-            int k = listTop + pt.y() / rowHeight();
-            if (k >= 0 && k < data().names.size()) { sel = k; openPicker(); }
-        };
+        // A (left click) acts on what the D-pad highlighted, wherever the stick cursor happens to be
+        list->onClick = [this](const QPoint &) { openPicker(); };
         graphs->onClick = [this](const QPoint &) { openPicker(); };
-        overlay->onClick = [this](const QPoint &pt) { overlayClick(pt); };
+        overlay->onClick = [this](const QPoint &) { activateOverlay(); };
 
         statusTimer = new QTimer(this);
         statusTimer->setInterval(1000);
@@ -2607,11 +2607,18 @@ protected:
         const int n = data().names.size();
         if (pickMode == 1)   // graph / side picker
         {
-            if (key == Qt::Key_Left)       pickGraph = qMax(0, pickGraph - 1);
-            else if (key == Qt::Key_Right) pickGraph = qMin(4, pickGraph + 1);
-            else if (key == Qt::Key_Up)    pickSide = 'A';
-            else if (key == Qt::Key_Down)  pickSide = 'B';
-            else if (enter)                applyPicker();
+            // up/down: Graph, Side, Colour, Accept/Cancel rows; left/right: change the choice on that row
+            if (key == Qt::Key_Up)          pickRow = qMax(0, pickRow - 1);
+            else if (key == Qt::Key_Down)   pickRow = qMin(3, pickRow + 1);
+            else if (key == Qt::Key_Left || key == Qt::Key_Right)
+            {
+                int d = key == Qt::Key_Left ? -1 : 1;
+                if (pickRow == 0)      pickGraph = qBound(0, pickGraph + d, 4);
+                else if (pickRow == 1) pickSide = d < 0 ? 'A' : 'B';
+                else if (pickRow == 2) pickColor = qBound(0, pickColor + d, R36S_CSV_COLORS - 1);
+                else                   pickCancel = d > 0;
+            }
+            else if (enter)                 activateOverlay();
             else if (key == Qt::Key_Escape) pickMode = 0;
             else return QWidget::keyPressEvent(e);
             updateAll();
@@ -2658,9 +2665,13 @@ private:
     int sel = 0, pos = 0, win = 600, listTop = 0, repeats = 0;
     QVector<int> graph;          // per column: 0 = not shown, 1-4 = graph
     QVector<char> side;          // per column: 'A' or 'B'
+    QVector<int> color;          // per column: 0-5, see r36sCsvColor
     int pickMode = 0;            // 0 none, 1 graph picker, 2 log list
     int pickGraph = 1;
     char pickSide = 'A';
+    int pickColor = 0;
+    int pickRow = 0;             // picker row with the focus: 0 graph, 1 side, 2 colour, 3 accept/cancel
+    bool pickCancel = false;     // on row 3: Cancel highlighted instead of Accept
     QStringList logs;
     int logSel = 0, logTop = 0;
     QRect panel;
@@ -2755,6 +2766,9 @@ private:
         int n = d.names.size();
         graph = QVector<int>(n, 0);
         side = QVector<char>(n, 'A');
+        color = QVector<int>(n, 0);
+        for (int k = 0; k < n; k++)
+            color[k] = k % R36S_CSV_COLORS;
         QList<int> show;
         for (const QString &want : r36sCsvDisplayNames())
             for (int k = 0; k < n; k++)
@@ -2770,14 +2784,16 @@ private:
         {
             graph[show.at(i)] = i / 2 + 1;
             side[show.at(i)] = (i % 2) ? 'B' : 'A';
+            color[show.at(i)] = i;   // the 6 display values start with 6 different colours
         }
         for (int k = 0; k < n; k++)
         {
             auto it = r36sCsvPicks.constFind(d.names.at(k));
             if (it != r36sCsvPicks.constEnd())
             {
-                graph[k] = it.value().first;
-                side[k] = it.value().second;
+                graph[k] = it.value().graph;
+                side[k] = it.value().side;
+                color[k] = it.value().color;
             }
         }
         sel = qBound(0, sel, qMax(0, n - 1));
@@ -2789,6 +2805,9 @@ private:
             return;
         pickGraph = graph.value(sel) ? graph.value(sel) : 1;
         pickSide = side.value(sel, 'A');
+        pickColor = color.value(sel, 0);
+        pickRow = 0;
+        pickCancel = false;
         pickMode = 1;
         updateAll();
     }
@@ -2799,7 +2818,8 @@ private:
         {
             graph[sel] = pickGraph;
             side[sel] = pickSide;
-            r36sCsvPicks.insert(data().names.at(sel), qMakePair(pickGraph, pickSide));
+            color[sel] = pickColor;
+            r36sCsvPicks.insert(data().names.at(sel), R36SCsvPick{ pickGraph, pickSide, pickColor });
         }
         pickMode = 0;
     }
@@ -2872,7 +2892,7 @@ private:
             QColor ink = on ? palette().highlightedText().color() : palette().text().color();
             QRect box(row.x() + 5, row.y() + (rh - 10) / 2, 10, 10);
             if (graph.value(k))
-                p.fillRect(box, r36sCsvColor(k));
+                p.fillRect(box, r36sCsvColor(color.value(k)));
             else
             {
                 p.setPen(ink);
@@ -2951,7 +2971,7 @@ private:
                 QString pre = QString("%1: ").arg(side.at(k)), val = " " + valueText(k);
                 int nameW = itemW - sfm.horizontalAdvance(pre + val) - 8;
                 QString txt = pre + sfm.elidedText(d.names.at(k), Qt::ElideRight, qMax(10, nameW)) + val;
-                p.setPen(r36sCsvColor(k));
+                p.setPen(r36sCsvColor(color.value(k)));
                 // A values from the left (their scale is on the left), B values from the right
                 QRect cell(head.x() + 4 + i * itemW, head.y(), itemW, head.height());
                 p.drawText(cell, Qt::AlignVCenter | (isB ? Qt::AlignRight : Qt::AlignLeft), txt);
@@ -2976,7 +2996,7 @@ private:
                 lo -= pad;
                 hi += pad;
                 // scale labels: top, middle, bottom
-                p.setPen(r36sCsvColor(first));
+                p.setPen(r36sCsvColor(color.value(first)));
                 int ld = qMin(decs, 1);
                 QRect lab = s == 'A' ? QRect(box.x(), plot.y(), L - 4, plot.height())
                                      : QRect(plot.right() + 4, plot.y(), R - 4, plot.height());
@@ -3021,7 +3041,7 @@ private:
                             }
                         }
                     }
-                    p.setPen(QPen(r36sCsvColor(k), 1.5));
+                    p.setPen(QPen(r36sCsvColor(color.value(k)), 1.5));
                     p.drawPolyline(line);
                 }
                 p.setClipping(false);
@@ -3059,7 +3079,7 @@ private:
         int lh = fm.height() + 10;
         if (pickMode == 1)
         {
-            int w = qMin(r.width() - 20, 360), h = lh * 5 + 12;
+            int w = qMin(r.width() - 20, 440), h = lh * 6 + 12;
             panel = QRect(r.center().x() - w / 2, r.center().y() - h / 2, w, h);
             p.fillRect(panel, palette().window());
             p.setPen(palette().dark().color());
@@ -3067,26 +3087,53 @@ private:
             QRect line(panel.x() + 10, panel.y() + 6, w - 20, lh);
             p.setPen(palette().text().color());
             p.drawText(line, Qt::AlignVCenter | Qt::AlignLeft, fm.elidedText(data().names.value(sel), Qt::ElideRight, line.width()));
-            int bx = line.x() + fm.horizontalAdvance("Scale") + 12;
-            line.translate(0, lh);
-            p.setPen(palette().text().color());
-            p.drawText(line, Qt::AlignVCenter | Qt::AlignLeft, "Graph");
+            int bx = line.x() + fm.horizontalAdvance("Colour") + 14;
+            // the row with the focus gets a light band and a marker, so up/down is easy to follow
+            QColor band = palette().highlight().color();
+            band.setAlpha(50);
+            auto rowLabel = [&](int row, const QString &text) {
+                line.translate(0, lh);
+                if (pickRow == row)
+                {
+                    p.fillRect(QRect(panel.x() + 2, line.y(), panel.width() - 4, lh), band);
+                    p.fillRect(QRect(panel.x() + 2, line.y() + 3, 3, lh - 6), palette().highlight());
+                }
+                p.setPen(palette().text().color());
+                p.drawText(line, Qt::AlignVCenter | Qt::AlignLeft, text);
+            };
+            rowLabel(0, "Graph");
             int bw = (line.right() - bx) / 5;
             for (int g = 0; g <= 4; g++)
-                drawOption(p, QRect(bx + g * bw, line.y() + 2, bw - 4, lh - 4), g ? QString::number(g) : "Off", pickGraph == g, g);
-            line.translate(0, lh);
-            p.setPen(palette().text().color());
-            p.drawText(line, Qt::AlignVCenter | Qt::AlignLeft, "Scale");
+                drawOption(p, QRect(bx + g * bw, line.y() + 3, bw - 4, lh - 6), g ? QString::number(g) : "Off", pickGraph == g, g);
+            rowLabel(1, "Side");
             bw = (line.right() - bx) / 2;
-            drawOption(p, QRect(bx, line.y() + 2, bw - 4, lh - 4), "A  left", pickSide == 'A', 10);
-            drawOption(p, QRect(bx + bw, line.y() + 2, bw - 4, lh - 4), "B  right", pickSide == 'B', 11);
+            drawOption(p, QRect(bx, line.y() + 3, bw - 4, lh - 6), "A  left", pickSide == 'A', 10);
+            drawOption(p, QRect(bx + bw, line.y() + 3, bw - 4, lh - 6), "B  right", pickSide == 'B', 11);
+            rowLabel(2, "Colour");
+            bw = (line.right() - bx) / R36S_CSV_COLORS;
+            for (int c = 0; c < R36S_CSV_COLORS; c++)
+            {
+                QRect sw(bx + c * bw, line.y() + 3, bw - 4, lh - 6);
+                p.fillRect(sw, r36sCsvColor(c));
+                if (pickColor == c)   // chosen: thick outline in the text colour
+                {
+                    p.setPen(QPen(palette().text().color(), 3));
+                    p.drawRect(sw.adjusted(1, 1, -2, -2));
+                }
+            }
             line.translate(0, lh);
+            if (pickRow == 3)
+                p.fillRect(QRect(panel.x() + 2, line.y(), panel.width() - 4, lh), band);
             int half = (line.width() - 4) / 2;
-            drawOption(p, QRect(line.x(), line.y() + 2, half, lh - 4), "Apply", false, 20);
-            drawOption(p, QRect(line.x() + half + 4, line.y() + 2, half, lh - 4), "Cancel", false, 21);
+            drawOption(p, QRect(line.x(), line.y() + 3, half, lh - 6), "Accept", pickRow == 3 && !pickCancel, 20);
+            drawOption(p, QRect(line.x() + half + 4, line.y() + 3, half, lh - 6), "Cancel", pickRow == 3 && pickCancel, 21);
             line.translate(0, lh);
+            QFont hint = font();
+            hint.setPointSizeF(qMax(6.0, hint.pointSizeF() - 2));
+            p.setFont(hint);
             p.setPen(palette().dark().color());
-            p.drawText(line, Qt::AlignVCenter | Qt::AlignLeft, "D-pad: choose   Y: apply   B: cancel");
+            p.drawText(line, Qt::AlignVCenter | Qt::AlignLeft, "Up/down: row   Left/right: choose   Y: accept   B: cancel");
+            p.setFont(font());
         }
         else if (pickMode == 2)
         {
@@ -3123,29 +3170,20 @@ private:
         }
     }
 
-    void overlayClick(const QPoint &pt)
+    // Y (Enter) or A (click, anywhere): accept the picker, or Cancel if it is highlighted;
+    // in the log list, open the highlighted log
+    void activateOverlay()
     {
-        for (const auto &h : hits)
-            if (h.first.contains(pt))
-            {
-                int id = h.second;
-                if (id <= 4)        pickGraph = id;
-                else if (id == 10)  pickSide = 'A';
-                else if (id == 11)  pickSide = 'B';
-                else if (id == 20)  applyPicker();
-                else if (id == 21)  pickMode = 0;
-                else if (id >= 100) openFromList(id - 100);
-                updateAll();
-                return;
-            }
-        if (!panel.contains(pt))   // A pressed with the cursor away from the box: act on the highlighted choice
+        if (pickMode == 1)
         {
-            if (pickMode == 1)
+            if (pickRow == 3 && pickCancel)
+                pickMode = 0;
+            else
                 applyPicker();
-            else if (pickMode == 2)
-                openFromList(logSel);
-            updateAll();
         }
+        else if (pickMode == 2)
+            openFromList(logSel);
+        updateAll();
     }
 };
 
@@ -3181,6 +3219,7 @@ void r36sCsvLiveRow(const QStringList &row)
         r36sCsvViewer->liveRowAdded(dropped);
 }
 // ===== end R36S CSV viewer =====
+
 
 // ===== R36S pointer: hides when not in use =====
 // The stick cursor hides as soon as the D-pad (or Y) is used, or after 3 s without stick
