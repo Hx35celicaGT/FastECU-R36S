@@ -99,7 +99,7 @@ static void r36sAppendAddr(QByteArray &out, const QString &addrText, const QStri
 // "display" entries go in the 6 boxes, "log" entries are only recorded to CSV,
 // "switch" entries are switches recorded to CSV.
 
-static const QString R36S_FILES_DIR = "/root/FastECU/Files/";
+static const QString R36S_FILES_DIR = qEnvironmentVariableIsSet("FASTECU_FILES") ? QDir(qEnvironmentVariable("FASTECU_FILES")).absolutePath() + "/" : QString("/root/FastECU/Files/");
 static const int R36S_MAX_DISPLAY = 6;
 static const int R36S_MAX_ADDRESSES = 80;   // one SSM A8 request: length byte limits it to ~84 addresses
 
