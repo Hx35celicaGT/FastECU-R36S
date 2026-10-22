@@ -3644,81 +3644,6 @@ static QWidget *r36sGraphViewCreate(QWidget *parent)
     return box;
 }
 // ===== end R36S 2D / 3D graph =====
-```
-
-When done, the line `// ===== R36S desktops (L1 / R1) =====` should sit right after `// ===== end R36S 2D / 3D graph =====` (a blank line between is fine).
-
-### Edit 5 - put the graph page on desktop 3 (the only replace)
-
-`Ctrl+F` and search for: `r36sCsvViewerCreate(stack)`. You'll land on these three lines inside `r36sDesktopOverlay()`:
-
-```cpp
-            QWidget *page = i == 1 ? r36sCsvViewerCreate(stack) : new QWidget(stack);   // desktop 2 = CSV viewer
-            if (i != 1)
-                r36sDesktopBuild(i, page);
-```
-
-Select exactly those three lines (click at the start of the first, `Shift`+click at the end of the third) and paste this in their place:
-
-```cpp
-            QWidget *page;
-            if (i == 1)
-                page = r36sCsvViewerCreate(stack);       // desktop 2 = CSV viewer
-            else if (i == 2)
-                page = r36sGraphViewCreate(stack);       // desktop 3 = 2D / 3D graph
-            else
-            {
-                page = new QWidget(stack);
-                r36sDesktopBuild(i, page);
-            }
-```
-
-The lines just after it, `stack->addWidget(page);` and the closing `}`, stay as they are.
-
-### Edit 6 - the send function
-
-`Ctrl+F` and search for: `// ===== end R36S desktops =====` (near the end of the file).
-
-Press `Home`, `Enter`, up arrow, so you're on a new empty line just above it, then paste:
-
-```cpp
-// R36S: called from a map window's "Send To ... Graph" menu (menu_actions.cpp).
-// mode 0 = 2D/3D, 1 = X axis, 2 = Y axis. z[row][col] uses row = Y step, col = X step.
-// Replaces whatever graph was there and switches to desktop 3 (2D / 3D).
-void r36sGraphShow(int mode, const QString &title, const QString &file,
-                   const QString &xName, const QString &yName, const QString &zName,
-                   const QVector<double> &x, const QVector<double> &y,
-                   const QStringList &xText, const QStringList &yText,
-                   const QVector<QVector<double> > &z)
-{
-    R36SGraph g;
-    g.title = title;
-    g.file = file;
-    g.xName = xName;
-    g.yName = yName;
-    g.zName = zName;
-    g.x = x;
-    g.y = y;
-    g.xText = xText;
-    g.yText = yText;
-    g.z = z;
-    int nx = x.size(), ny = y.size();
-    if (mode == 0)
-        g.mode = (nx > 1 && ny > 1) ? 0 : (nx > 1 ? 1 : 2);   // one axis only: a single line
-    else
-        g.mode = mode;
-    r36sGraph = g;
-    if (r36sGraphView)
-        r36sGraphView->update();
-
-    if (r36sEcuBusy)
-        return;                                 // never switch desktops during a ROM read / write
-    int current = r36sDesktopIndexOf(QApplication::activeWindow());
-    r36sDesktopShow(current < 0 ? 0 : current, 2);
-    if (r36sGraphView)
-        r36sGraphView->update();
-}
-
 
 // ===== R36S desktops (L1 / R1) =====
 // L1 and R1 send Shift+Tab and Tab. On the FastECU screen and on the other desktops they
@@ -3773,9 +3698,16 @@ static QWidget *r36sDesktopOverlay()
         QStackedWidget *stack = new QStackedWidget(w);
         for (int i = 1; i < R36S_DESKTOP_COUNT; i++)
         {
-            QWidget *page = i == 1 ? r36sCsvViewerCreate(stack) : new QWidget(stack);   // desktop 2 = CSV viewer
-            if (i != 1)
+            QWidget *page;
+            if (i == 1)
+                page = r36sCsvViewerCreate(stack);       // desktop 2 = CSV viewer
+            else if (i == 2)
+                page = r36sGraphViewCreate(stack);       // desktop 3 = 2D / 3D graph
+            else
+            {
+                page = new QWidget(stack);
                 r36sDesktopBuild(i, page);
+            }
             stack->addWidget(page);
         }
         layout->addWidget(stack);
@@ -3865,7 +3797,42 @@ void r36sDesktopsInstall(QMainWindow *win)
     qApp->installEventFilter(new R36SPointerHider(win));   // R36S: pointer hides when not in use
 }
 // ===== end R36S desktops =====
+// R36S: called from a map window's "Send To ... Graph" menu (menu_actions.cpp).
+// mode 0 = 2D/3D, 1 = X axis, 2 = Y axis. z[row][col] uses row = Y step, col = X step.
+// Replaces whatever graph was there and switches to desktop 3 (2D / 3D).
+void r36sGraphShow(int mode, const QString &title, const QString &file,
+                   const QString &xName, const QString &yName, const QString &zName,
+                   const QVector<double> &x, const QVector<double> &y,
+                   const QStringList &xText, const QStringList &yText,
+                   const QVector<QVector<double> > &z)
+{
+    R36SGraph g;
+    g.title = title;
+    g.file = file;
+    g.xName = xName;
+    g.yName = yName;
+    g.zName = zName;
+    g.x = x;
+    g.y = y;
+    g.xText = xText;
+    g.yText = yText;
+    g.z = z;
+    int nx = x.size(), ny = y.size();
+    if (mode == 0)
+        g.mode = (nx > 1 && ny > 1) ? 0 : (nx > 1 ? 1 : 2);   // one axis only: a single line
+    else
+        g.mode = mode;
+    r36sGraph = g;
+    if (r36sGraphView)
+        r36sGraphView->update();
 
+    if (r36sEcuBusy)
+        return;                                 // never switch desktops during a ROM read / write
+    int current = r36sDesktopIndexOf(QApplication::activeWindow());
+    r36sDesktopShow(current < 0 ? 0 : current, 2);
+    if (r36sGraphView)
+        r36sGraphView->update();
+}
 
 // ===== end R36S Set value window =====
 
