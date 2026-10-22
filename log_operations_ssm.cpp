@@ -2101,7 +2101,7 @@ void MainWindow::log_to_file(){
 //                number spot: (empty) 0 1 2 3 4 5 6 7 8 9 .
 //                first spot also has '-' when the operation is '=' (set a negative value)
 //   Empty spots are skipped, so  x .98   = 1000   x 1.27  are all fine.
-//   There is only one '.': putting it somewhere else moves it.
+//   There is only one '.': once placed, other spots skip it (scroll it off its own spot to move it).
 //   Y / Enter = apply, B / Esc = cancel. On a keyboard you can also type 0-9 . = + - * /
 // Returns the same text the old typing box did ("=1000", "+20", "-5", "*0.98", "/2"),
 // so FastECU's own code does the math on every selected cell.
@@ -2184,7 +2184,7 @@ protected:
         {
             int step = (k == Qt::Key_Up) ? 1 : -1;
             if (pos == 0) pick[0] = (pick[0] - step + OPS) % OPS;      // Up goes up the list  = + - x /
-            else { int n = choices(pos); setSpot(pos, (pick[pos] + step + n) % n); }   // Up: empty, 0..9, . (, -)
+              else setSpot(pos, nextChoice(pos, step));   // Up: empty, 0..9, . (, -)  '.' skipped if already used
         }
         else if (k >= Qt::Key_0 && k <= Qt::Key_9)
         {
@@ -2242,6 +2242,25 @@ private:
     // '-' is only offered on the first spot while the operation is '='
     int choices(int p) const { return (p == 1 && pick[0] == 0) ? CHOICES + 1 : CHOICES; }
 
+    // Is the '.' already used on some other spot?
+    bool hasDotElsewhere(int p) const
+    {
+        for (int k = 1; k < POS; k++)
+            if (k != p && pick[k] == DOT) return true;
+        return false;
+    }
+
+    // Next choice for spot p going Up (+1) or Down (-1).
+    // '.' is skipped when another spot already has it, so scrolling never steals it.
+    int nextChoice(int p, int step) const
+    {
+        int n = choices(p);
+        int v = (pick[p] + step + n) % n;
+        if (v == DOT && hasDotElsewhere(p))
+            v = (v + step + n) % n;
+        return v;
+    }
+
     // Only one '.': putting it somewhere empties the old one
     void setSpot(int p, int v)
     {
@@ -2275,7 +2294,7 @@ private:
             else
             {
                 int n = choices(k);
-                up = spotChar(pick[k] + 1, n); now = spotChar(pick[k], n); down = spotChar(pick[k] - 1, n);
+                up = spotChar(nextChoice(k, 1), n); now = spotChar(pick[k], n); down = spotChar(nextChoice(k, -1), n);
                 if (up.isEmpty())   up = "_";
                 if (down.isEmpty()) down = "_";
             }
