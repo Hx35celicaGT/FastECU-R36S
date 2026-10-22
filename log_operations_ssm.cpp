@@ -1100,6 +1100,11 @@ void r36sApplyLogSetup(FileActions::LogValuesStructure *lv, const QString &proto
 
     // R36S: math channels must exist before display/log/warn names are matched
     QStringList mathLines;
+    for (const QPair<QString, QString> &e : entries)
+        if (e.first == "math")
+            mathLines.append(e.second);
+    r36sMathBuild(lv, protocol, mathLines, notFound);
+    r36sWarnings.clear();
 
     for (const QPair<QString, QString> &e : entries)
     {
