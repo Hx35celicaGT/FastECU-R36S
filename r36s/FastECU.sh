@@ -83,6 +83,20 @@ echo "Gamepad: $GAMEPAD_DEV"
 # gamepad_mouse needs the uinput driver to make the virtual mouse/keyboard
 [ -e /dev/uinput ] || modprobe uinput
 
+# ---------- USB check (for bug reports) ----------
+# Which cables the R36S sees and which serial drivers this Arch R has.
+echo "=== USB check"
+echo "- serial ports:"; ls -l /dev/ttyUSB* /dev/ttyACM* 2>&1
+echo "- USB devices (vendor:product name):"
+for d in /sys/bus/usb/devices/*; do
+    [ -f "$d/idVendor" ] && echo "  $(cat "$d/idVendor"):$(cat "$d/idProduct") $(cat "$d/manufacturer" 2>/dev/null) $(cat "$d/product" 2>/dev/null)"
+done
+echo "- kernel messages:"; dmesg 2>/dev/null | grep -i -E 'usb|ch34|ttyUSB|ttyACM|cdc|ftdi|cp210' | tail -25
+echo "- serial drivers available:"
+ls "/lib/modules/$(uname -r)/kernel/drivers/usb/serial/" 2>&1
+zcat /proc/config.gz 2>/dev/null | grep -E 'USB_SERIAL_CH341|USB_SERIAL_FTDI|USB_SERIAL_CP210|USB_ACM'
+echo "=== end USB check"
+
 echo "Running from: $APPDIR"
 echo "----"
 

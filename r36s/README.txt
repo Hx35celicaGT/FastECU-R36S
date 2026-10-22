@@ -65,7 +65,8 @@ All on the card, inside ports/FastECU-R36S:
   FastECU-Files/       log_setup.txt (what is shown and logged)
   userdata/            settings, and datalogs (CSV files) in
                        userdata/.config/FastECU/<version>/datalogs
-  fastecu-debug.log    what happened on the last run (attach to bug reports)
+  fastecu-debug.log    what happened on the last run, including which USB
+                       cables the R36S saw (attach to bug reports)
 
 
 REPORTING A PROBLEM
