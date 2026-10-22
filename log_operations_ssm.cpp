@@ -3319,6 +3319,7 @@ private:
 //   X axis: the map values against the X axis, one line for each Y row.
 //   Y axis: the map values against the Y axis, one line for each X column.
 #include <algorithm>
+#include <QKeyEvent>
 
 struct R36SGraph
 {
@@ -3330,6 +3331,9 @@ struct R36SGraph
     QVector<QVector<double> > z;    // z[row][col]: row = Y index, col = X index
 };
 static R36SGraph r36sGraph;
+
+static const double R36S_GRAPH_AZ0 = -32.0, R36S_GRAPH_EL0 = 30.0;   // starting 3D view (degrees)
+static double r36sGraphAz = R36S_GRAPH_AZ0, r36sGraphEl = R36S_GRAPH_EL0;   // current 3D view
 
 // Same colours as the map table: low = red, high = blue
 static QColor r36sGraphColor(double t)
@@ -3488,7 +3492,7 @@ static void r36sGraphPaintLines(QPainter &p, const QRect &area, const R36SGraph 
     }
 }
 
-// Surface: fixed view from the front-left, cells filled with the table colours
+// Surface: cells filled with the table colours. The view turns with a drag or the arrow keys.
 static void r36sGraphPaintSurface(QPainter &p, const QRect &area, const R36SGraph &g, const QPalette &pal)
 {
     const int ny = g.z.size();
@@ -3505,7 +3509,7 @@ static void r36sGraphPaintSurface(QPainter &p, const QRect &area, const R36SGrap
     if (yHi - yLo < 1e-9) { yLo -= 1; yHi += 1; }
 
     // world: u = X (0..1), v = Y (0..1, row 0 at the front), w = value (0..1)
-    const double az = -32.0 * M_PI / 180.0, el = 30.0 * M_PI / 180.0, zs = 0.75;
+    const double az = r36sGraphAz * M_PI / 180.0, el = r36sGraphEl * M_PI / 180.0, zs = 0.75;
     const double ca = cos(az), sa = sin(az), ce = cos(el), se = sin(el);
     auto proj = [&](double u, double v, double w, double *depth) {
         double x = u - 0.5, y = 0.5 - v, z = (w - 0.5) * zs;
@@ -3514,25 +3518,25 @@ static void r36sGraphPaintSurface(QPainter &p, const QRect &area, const R36SGrap
         if (depth) *depth = ry;
         return QPointF(rx, ry * se - z * ce);
     };
+    auto depthAt = [&](double u, double v) { double d; proj(u, v, 0, &d); return d; };
     auto U = [&](int i) { return (g.x.at(i) - xLo) / (xHi - xLo); };
     auto V = [&](int j) { return (g.y.at(j) - yLo) / (yHi - yLo); };
     auto W = [&](double val) { return (val - lo) / (hi - lo); };
 
-    // fit the box (floor and top corners) into the drawing area, leaving room for labels
+    // fixed size for every angle, so the graph does not grow or shrink while it turns
     const int legendW = fm.horizontalAdvance("-00000.0") + 26;
-    QRectF room(area.x() + fm.horizontalAdvance("00000") + 8, area.y() + fm.height() + 6,
-                area.width() - legendW - fm.horizontalAdvance("00000") * 2 - 16, area.height() - fm.height() * 4 - 14);
+    QRectF room(area.x() + fm.horizontalAdvance("00000") + 8, area.y() + fm.height() * 2 + 6,
+                area.width() - legendW - fm.horizontalAdvance("00000") * 2 - 16, area.height() - fm.height() * 5 - 14);
     if (room.width() < 40 || room.height() < 40)
         return;
-    QRectF box;
-    for (int c = 0; c < 8; c++)
-    {
-        QPointF q = proj(c & 1, (c >> 1) & 1, (c >> 2) & 1, nullptr);
-        box = box.isNull() ? QRectF(q, QSizeF(1e-6, 1e-6)) : box.united(QRectF(q, QSizeF(1e-6, 1e-6)));
-    }
-    double sc = qMin(room.width() / box.width(), room.height() / box.height());
-    QPointF off = room.center() - box.center() * sc;
+    const double halfW = sqrt(0.5), halfH = sqrt(0.5 + zs * zs / 4);
+    double sc = qMin(room.width() / (2 * halfW), room.height() / (2 * halfH));
+    QPointF off = room.center();
     auto S = [&](double u, double v, double w) { return proj(u, v, w, nullptr) * sc + off; };
+
+    // which sides are at the back (walls) and at the front (labels) from this angle
+    const int farV = depthAt(0.5, 0) < depthAt(0.5, 1) ? 0 : 1, nearV = 1 - farV;
+    const int farU = depthAt(0, 0.5) < depthAt(1, 0.5) ? 0 : 1, nearU = 1 - farU;
 
     // floor and back walls
     p.setPen(QPen(pal.mid().color(), 1));
@@ -3543,22 +3547,21 @@ static void r36sGraphPaintSurface(QPainter &p, const QRect &area, const R36SGrap
     p.setPen(QPen(pal.mid().color(), 1, Qt::DotLine));
     for (int i = 0; i < nx; i++) p.drawLine(S(U(i), 0, 0), S(U(i), 1, 0));
     for (int j = 0; j < ny; j++) p.drawLine(S(0, V(j), 0), S(1, V(j), 0));
-    p.drawLine(S(0, 1, 0), S(0, 1, 1));
-    p.drawLine(S(1, 1, 0), S(1, 1, 1));
+    p.drawLine(S(0, farV, 0), S(0, farV, 1));
+    p.drawLine(S(1, farV, 0), S(1, farV, 1));
+    p.drawLine(S(farU, nearV, 0), S(farU, nearV, 1));
     for (int k = 1; k <= 4; k++)
-        p.drawLine(S(0, 1, k / 4.0), S(1, 1, k / 4.0));
+    {
+        p.drawLine(S(0, farV, k / 4.0), S(1, farV, k / 4.0));
+        p.drawLine(S(farU, 0, k / 4.0), S(farU, 1, k / 4.0));
+    }
 
     // cells, far ones first
     struct Cell { double depth; int i, j; };
     QVector<Cell> cells;
     for (int j = 0; j + 1 < ny; j++)
         for (int i = 0; i + 1 < nx; i++)
-        {
-            double d = 0, t;
-            proj((U(i) + U(i + 1)) / 2, (V(j) + V(j + 1)) / 2, 0, &t);
-            d = t;
-            cells.append(Cell{ d, i, j });
-        }
+            cells.append(Cell{ depthAt((U(i) + U(i + 1)) / 2, (V(j) + V(j + 1)) / 2), i, j });
     std::sort(cells.begin(), cells.end(), [](const Cell &a, const Cell &b) { return a.depth < b.depth; });
     for (const Cell &c : cells)
     {
@@ -3573,16 +3576,21 @@ static void r36sGraphPaintSurface(QPainter &p, const QRect &area, const R36SGrap
     }
     p.setBrush(Qt::NoBrush);
 
-    // axis labels on the front edges
+    // axis labels on the two front edges of the floor
     p.setPen(pal.text().color());
     QVector<QPointF> xa, ya;
-    for (int i = 0; i < nx; i++) xa << S(U(i), 0, 0) + QPointF(0, 3);
-    for (int j = 0; j < ny; j++) ya << S(1, V(j), 0) + QPointF(4, 0);
+    for (int i = 0; i < nx; i++) xa << S(U(i), nearV, 0) + QPointF(0, 3);
+    for (int j = 0; j < ny; j++) ya << S(nearU, V(j), 0);
+    bool yRight = S(nearU, 0.5, 0).x() >= off.x();
+    for (QPointF &q : ya) q += QPointF(yRight ? 4 : -4, 0);
     r36sGraphLabels(p, xa, g.xText, Qt::AlignHCenter);
-    r36sGraphLabels(p, ya, g.yText, Qt::AlignLeft | Qt::AlignVCenter);
+    r36sGraphLabels(p, ya, g.yText, (yRight ? Qt::AlignLeft : Qt::AlignRight) | Qt::AlignVCenter);
     QString names = "X: " + (g.xName.isEmpty() ? QString("steps") : g.xName) + "     Y: " + (g.yName.isEmpty() ? QString("steps") : g.yName);
     QRect caption(area.x(), area.bottom() - fm.height(), area.width() - legendW, fm.height() + 1);
     p.drawText(caption, Qt::AlignHCenter | Qt::AlignVCenter, fm.elidedText(names, Qt::ElideRight, caption.width()));
+    p.setPen(pal.mid().color());
+    p.drawText(QRect(area.x(), area.y(), area.width() - legendW, fm.height() + 2), Qt::AlignLeft | Qt::AlignVCenter,
+               "Drag or arrows: turn     Enter: reset view");
 
     // colour legend on the right
     QRect bar(area.right() - legendW + 6, area.y() + fm.height() + 10, 12, area.height() - fm.height() * 2 - 24);
@@ -3632,19 +3640,76 @@ static void r36sGraphPaint(QPainter &p, const QRect &r, const R36SGraph &g, cons
     else
         r36sGraphPaintLines(p, area, g, pal);
 }
+// ===== end R36S 2D / 3D graph =====
+// The graph page. Only the 3D view reacts: drag with the mouse (or the stick pointer)
+// or use the arrow keys / D-pad to turn it, Enter (Y) puts it back to the starting view.
+class R36SGraphBox : public QWidget
+{
+public:
+    explicit R36SGraphBox(QWidget *parent) : QWidget(parent) { setFocusPolicy(Qt::StrongFocus); }
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter p(this);
+        r36sGraphPaint(p, rect(), r36sGraph, palette());
+    }
+    void mousePressEvent(QMouseEvent *e) override
+    {
+        setFocus();
+        if (e->button() == Qt::LeftButton)
+        {
+            dragging = true;
+            last = e->pos();
+        }
+    }
+    void mouseMoveEvent(QMouseEvent *e) override
+    {
+        if (!dragging)
+            return;
+        QPoint d = e->pos() - last;
+        last = e->pos();
+        turn(-d.x() * 0.5, d.y() * 0.4);
+    }
+    void mouseReleaseEvent(QMouseEvent *) override { dragging = false; }
+    void keyPressEvent(QKeyEvent *e) override
+    {
+        switch (e->key())
+        {
+        case Qt::Key_Left:   turn(5, 0);  break;
+        case Qt::Key_Right:  turn(-5, 0); break;
+        case Qt::Key_Up:     turn(0, -5); break;
+        case Qt::Key_Down:   turn(0, 5);  break;
+        case Qt::Key_Return:
+        case Qt::Key_Enter:
+            r36sGraphAz = R36S_GRAPH_AZ0;
+            r36sGraphEl = R36S_GRAPH_EL0;
+            update();
+            break;
+        default:
+            QWidget::keyPressEvent(e);
+        }
+    }
+private:
+    bool dragging = false;
+    QPoint last;
+    void turn(double dAz, double dEl)
+    {
+        if (r36sGraph.mode != 0)
+            return;                                         // line graphs do not turn
+        r36sGraphAz = std::fmod(r36sGraphAz + dAz + 540.0, 360.0) - 180.0;
+        r36sGraphEl = qBound(0.0, r36sGraphEl + dEl, 90.0);  // from level with the floor to straight down
+        update();
+    }
+};
 
-static QPointer<R36SPaintBox> r36sGraphView;
+static QPointer<R36SGraphBox> r36sGraphView;
 
 static QWidget *r36sGraphViewCreate(QWidget *parent)
 {
-    R36SPaintBox *box = new R36SPaintBox(parent);
-    box->setFocusPolicy(Qt::StrongFocus);   // the page takes the keys so L1 / R1 still switch
-    box->onPaint = [box](QPainter &p, const QRect &r) { r36sGraphPaint(p, r, r36sGraph, box->palette()); };
+    R36SGraphBox *box = new R36SGraphBox(parent);   // the page takes the keys; L1 / R1 still switch
     r36sGraphView = box;
     return box;
 }
-// ===== end R36S 2D / 3D graph =====
-
 // ===== R36S desktops (L1 / R1) =====
 // L1 and R1 send Shift+Tab and Tab. On the FastECU screen and on the other desktops they
 // switch desktops; in dialogs (Log values, Set value, Settings ...) they stay Tab / Shift+Tab.
@@ -3656,8 +3721,8 @@ static QWidget *r36sGraphViewCreate(QWidget *parent)
 #include <QPointer>
 #include <QStackedWidget>
 
-static const char *R36S_DESKTOP_NAMES[] = { "FastECU", "CSV viewer", "2D / 3D", "Arduino control" };
-static const int R36S_DESKTOP_COUNT = 4;
+static const char *R36S_DESKTOP_NAMES[] = { "FastECU", "CSV viewer", "2D / 3D"};
+static const int R36S_DESKTOP_COUNT = 3;
 
 static QPointer<QMainWindow> r36sDeskMain;       // desktop 1 = FastECU main window
 static QPointer<QWidget> r36sDeskOverlay;        // one window holding desktops 2-4
