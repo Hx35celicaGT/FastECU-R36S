@@ -1,3 +1,5 @@
+// Modified for FastECU-R36S (R36S handheld running Arch R) by Victor, 2026-09 to 2026-10.
+// See CHANGES-R36S.md for what changed. Original FastECU: https://github.com/miikasyvanen/fastecu-oem (GPLv3).
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 #include <QSplashScreen>
