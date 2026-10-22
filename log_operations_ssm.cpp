@@ -1514,9 +1514,19 @@ static double r36sRawValue(const QByteArray &data, int offset, int length, const
 
 #include <QDoubleSpinBox>
 #include <QHBoxLayout>
+#include <QGuiApplication>
 #include <memory>
 
 static const int R36S_MATH_ROWS = 6;   // simple math channels on the Math tab
+
+
+// R36S: a dropdown sized for a few characters, not its longest name, so rows fit the screen
+// (the open list still shows the full names)
+static void r36sNarrowCombo(QComboBox *cb, int chars)
+{
+    cb->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    cb->setMinimumContentsLength(chars);
+}
 
 // Rewrite the display/log/switch/warn/math lines of log_setup.txt; comments and other lines stay
 static void r36sSaveLogSetup(const QStringList &display, const QStringList &logged, const QStringList &switches,
@@ -1627,7 +1637,11 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
 
     QDialog dlg(parent);
     dlg.setWindowTitle("Log values");
-    dlg.resize(600, 420);   // fits the R36S 640 x 480 screen
+      // R36S: never wider/taller than the screen (640 x 480 on the R36S)
+    QScreen *scr = (parent && parent->screen()) ? parent->screen() : QGuiApplication::primaryScreen();
+    QRect avail = scr->availableGeometry();
+    dlg.setMaximumSize(avail.size());
+    dlg.resize(qMin(600, avail.width() - 10), qMin(420, avail.height() - 10));
     QVBoxLayout *mainLayout = new QVBoxLayout(&dlg);
     QTabWidget *tabs = new QTabWidget(&dlg);
     mainLayout->addWidget(tabs);
@@ -1646,6 +1660,7 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
         a->addItem("(off)"); a->addItems(names); a->setMaxVisibleItems(12);
         b->addItem("(off)"); b->addItems(names); b->setMaxVisibleItems(12);
         op->addItems({ "+", "-", "x", "/" });
+        r36sNarrowCombo(a, 8); r36sNarrowCombo(b, 8); r36sNarrowCombo(op, 1);
         if (r < simpleIn.length())
         {
             const R36SMathChannel &m = simpleIn.at(r);
@@ -1709,14 +1724,16 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
         int k = i < curDisplay.length() ? cb->findText(curDisplay.at(i)) : -1;
         cb->setCurrentIndex(k > 0 ? k : 0);
 
+        r36sNarrowCombo(cb, 10);
         QComboBox *op = new QComboBox;
         op->addItems({ "off", "<", ">" });
+        r36sNarrowCombo(op, 3);
         op->setToolTip("Box turns red while the value is below (<) or above (>) the limit");
         QDoubleSpinBox *limit = new QDoubleSpinBox;
-        limit->setRange(-100000, 100000);
+        limit->setRange(-9999.99, 99999.99);
         limit->setDecimals(2);
         limit->setSingleStep(1);
-        limit->setMinimumWidth(90);
+        limit->setFixedWidth(95);
 
         QWidget *row = new QWidget;
         QHBoxLayout *h = new QHBoxLayout(row);

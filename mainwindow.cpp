@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 #include <QSplashScreen>
+#include <QPainter>
 #include "serial_port_actions.h"
 #include <QGroupBox>
 #include <QLabel>
@@ -164,6 +165,22 @@ MainWindow::MainWindow(QString peerAddress, QString peerPassword, QWidget *paren
     }
 
     QPixmap startUpSplashImage(":/images/startup_splash.jpg");
+        // R36S: on a small screen the splash window fills the screen from the top-left corner,
+    // so put the picture centred on a screen-sized black background (room left for the bar)
+    {
+        QSize scr = QGuiApplication::primaryScreen()->geometry().size();
+        if (scr.width() <= 800 && scr.height() <= 600)
+        {
+            QPixmap full(scr);
+            full.fill(Qt::black);
+            QSize area(scr.width(), scr.height() - 40);
+            QPixmap scaled = startUpSplashImage.scaled(area, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            QPainter painter(&full);
+            painter.drawPixmap((area.width() - scaled.width()) / 2, (area.height() - scaled.height()) / 2, scaled);
+            painter.end();
+            startUpSplashImage = full;
+        }
+    }
     int startUpSplashProgressBarValue = 0;
 
     startUpSplash = new QSplashScreen(startUpSplashImage);
