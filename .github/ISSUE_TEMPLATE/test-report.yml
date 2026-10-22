@@ -1,0 +1,75 @@
+name: Test report
+description: Report how FastECU-R36S worked (or didn't) on your R36S
+labels: ["test report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! Please fill in what you can.
+        Attach `fastecu-debug.log` from the `FastECU-R36S` folder on your card.
+  - type: input
+    id: version
+    attributes:
+      label: FastECU-R36S version
+      description: In VERSION.txt inside the FastECU-R36S folder
+      placeholder: v0.1
+    validations:
+      required: true
+  - type: input
+    id: board
+    attributes:
+      label: Board version
+      description: Printed on the circuit board
+      placeholder: R36S-V21
+    validations:
+      required: true
+  - type: dropdown
+    id: image
+    attributes:
+      label: Arch R image
+      options:
+        - Original
+        - Clone
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: archr
+    attributes:
+      label: Arch R version
+      placeholder: "2.1.1"
+  - type: input
+    id: cable
+    attributes:
+      label: OBD cable
+      description: Brand, and the chip if you know it (FTDI, CH340, OpenPort...)
+    validations:
+      required: true
+  - type: input
+    id: car
+    attributes:
+      label: Car and year
+      placeholder: 2006 WRX
+  - type: checkboxes
+    id: tested
+    attributes:
+      label: What did you try?
+      options:
+        - label: It started and the screen looked right
+        - label: Connected to the ECU
+        - label: Logging
+        - label: Log to CSV file
+        - label: Read ROM
+        - label: Write ROM
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: Files
+      description: Drag fastecu-debug.log here (and the CSV log if it is about logging)

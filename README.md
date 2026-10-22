@@ -1,3 +1,40 @@
+# FastECU-R36S
+
+**FastECU on the R36S handheld.** Log and tune Subaru ECUs from a pocket game console running [Arch R](https://github.com/archr-linux/Arch-R).
+
+> This is an unofficial port of [FastECU](https://github.com/miikasyvanen/fastecu-oem). Please report problems here, not to the FastECU authors.
+
+> ⚠️ **Test version.** Start with logging. Only read/write ROMs on an ECU you can recover.
+
+## Get it
+
+1. Download the latest `FastECU-R36S-<version>.zip` from [Releases](../../releases).
+2. Follow `README.txt` inside the zip. In short: flash Arch R with the [Arch R Flasher](https://github.com/archr-linux/archr-flasher/releases), copy `FastECU.sh` and the `FastECU-R36S` folder into the card's `ports` folder, and start FastECU from the Ports menu.
+
+No internet is needed on the R36S. Everything FastECU needs is inside the zip, and it works the same on original and clone boards.
+
+## Tested
+
+| Board | Arch R image | Cable | Car | Result |
+|---|---|---|---|---|
+| R36S-V21 | Original | | | Logging works |
+
+Tested something? [Send a test report](../../issues/new?template=test-report.yml).
+
+## For developers
+
+- What changed from FastECU: [CHANGES-R36S.md](CHANGES-R36S.md)
+- How to build and make a release: [r36s/BUILDING.md](r36s/BUILDING.md)
+- Work happens on the `r36s` branch. `master` follows upstream FastECU.
+
+## License
+
+GPLv3, like FastECU. See [LICENSE](LICENSE). Release zips include the full source and the licenses of every bundled library.
+
+---
+
+*The original FastECU README follows.*
+
 # FastECU
 
 Open source software to work on and modify Subaru ECUs and TCUs!

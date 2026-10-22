@@ -1,0 +1,29 @@
+Source code for the third-party libraries in this package
+=========================================================
+
+FastECU-R36S bundles libraries (Qt 5, glibc, OpenSSL and others) so it runs
+without internet and without installing anything. PACKAGES.txt lists every
+one, with its exact version and license. The licenses folder has the texts.
+
+All of them are unmodified binaries from Arch Linux ARM (aarch64) packages.
+
+Where to get their source code:
+  - Arch Linux ARM build files and patches:
+      https://github.com/archlinuxarm/PKGBUILDs
+  - Arch Linux package sources (the same package names):
+      https://gitlab.archlinux.org/archlinux/packaging/packages
+  - Qt 5 source, by version:
+      https://download.qt.io/archive/qt/
+  - glibc:   https://ftp.gnu.org/gnu/glibc/
+  - OpenSSL: https://github.com/openssl/openssl/releases
+
+Written offer: for at least three years after this release, the FastECU-R36S
+maintainer will provide the complete corresponding source code for any
+library in this package, at the exact version listed in PACKAGES.txt, to
+anyone who asks. Ask by opening an issue on the FastECU-R36S GitHub page.
+
+Replacing the libraries: every library is a separate file in app/lib. You can
+swap any of them for your own build of the same library, as the LGPL allows.
+
+FastECU-R36S's own source code is in the FastECU-R36S-<version>-source.tar.gz
+file in this package.

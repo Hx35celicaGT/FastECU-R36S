@@ -53,3 +53,14 @@ compile_commands.json
 *creator.user*
 
 *_qmlcache.qrc
+
+# FastECU-R36S
+/dist/
+/FastECU
+/Files/
+*.orig
+*.before-*
+build.log
+rep_*_replica.h
+/.xml
+fastecu-debug.log*
