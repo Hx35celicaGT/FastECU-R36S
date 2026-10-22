@@ -3,32 +3,49 @@
 #include "serial_port_actions.h"
 #include <cmath>
 #include <cstring>
+#include <functional>
 
 // ===== R36S: correct math for logged values =====
 // FastECU's expression evaluator groups * and / from the right, so an
 // expression like "x/128*14.7" (A/F Sensor) was computed as x/(128*14.7)
 // and showed ~0.07 instead of ~14.7. This evaluator uses normal math rules
 // (left to right, * and / before + and -, parentheses, negative numbers).
+// R36S math channels: with a lookup, [Value Name] reads a logged value, and
+// anything it can't work out (unknown name, no reading, divide by zero,
+// stray characters) marks the result bad so it shows as --.
 namespace {
 struct R36SExpr
 {
     const QString &s;
     int p;
     double x;
+    const std::function<double(const QString &, bool &)> *lookup = nullptr;   // math channels only
+    bool bad = false;
     R36SExpr(const QString &str, double xv) : s(str), p(0), x(xv) {}
     bool at(QChar c) { ws(); return p < s.size() && s.at(p) == c; }
     void ws() { while (p < s.size() && s.at(p).isSpace()) p++; }
     double primary()
     {
         ws();
-        if (p >= s.size()) return 0;
+        if (p >= s.size()) { if (lookup) bad = true; return 0; }
         QChar c = s.at(p);
         if (c == '-' || c == '+') { p++; double v = primary(); return c == '-' ? -v : v; }
-        if (c == '(') { p++; double v = sum(); if (at(')')) p++; return v; }
-        if (c == 'x' || c == 'X') { p++; return x; }
+        if (c == '(') { p++; double v = sum(); if (at(')')) p++; else if (lookup) bad = true; return v; }
+        if (c == '[' && lookup)
+        {
+            int end = s.indexOf(']', p);
+            if (end < 0) { bad = true; p = s.size(); return 0; }
+            QString name = s.mid(p + 1, end - p - 1);
+            p = end + 1;
+            bool ok = false;
+            double v = (*lookup)(name, ok);
+            if (!ok) bad = true;
+            return v;
+        }
+        if (!lookup && (c == 'x' || c == 'X')) { p++; return x; }
         int start = p;
         while (p < s.size() && (s.at(p).isDigit() || s.at(p) == '.')) p++;
-        if (start == p) { p++; return 0; }          // skip anything unexpected
+        if (start == p) { p++; if (lookup) bad = true; return 0; }   // skip anything unexpected
         return s.mid(start, p - start).toDouble();
     }
     double product()
@@ -36,7 +53,7 @@ struct R36SExpr
         double v = primary();
         for (;;) {
             if (at('*')) { p++; v *= primary(); }
-            else if (at('/')) { p++; double d = primary(); v = (d != 0) ? v / d : 0; }
+            else if (at('/')) { p++; double d = primary(); if (d == 0 && lookup) bad = true; v = (d != 0) ? v / d : 0; }
             else return v;
         }
     }
@@ -57,6 +74,17 @@ static double r36sEvalExpr(const QString &expr, double x)
     R36SExpr e(expr, x);
     double v = e.sum();
     return std::isnan(v) || std::isinf(v) ? 0 : v;
+}
+
+// Math channel formula: [Name] values come from lookup. ok = false when it can't be worked out.
+static double r36sEvalMath(const QString &expr, const std::function<double(const QString &, bool &)> &lookup, bool &ok)
+{
+    R36SExpr e(expr, 0);
+    e.lookup = &lookup;
+    double v = e.sum();
+    e.ws();
+    ok = !e.bad && e.p >= expr.size() && !std::isnan(v) && !std::isinf(v);
+    return ok ? v : 0;
 }
 // ===== end R36S math =====
 
@@ -106,6 +134,25 @@ static const int R36S_MAX_ADDRESSES = 80;   // one SSM A8 request: length byte l
 static QStringList r36sDisplayIds;                    // ids shown in the boxes, in order
 static QHash<int, QPair<double, double> > r36sMinMax; // value index -> (min, max) since logging started
 
+// R36S: math channels (math = Name | formula | unit), worked out after every ECU reply
+struct R36SMathChannel
+{
+    QString name, formula, unit;
+    bool simple = false;          // [A] op [B], made on the Math tab (editable there)
+    QString a, b;                 // simple only: the two value names
+    QChar op;                     // simple only: + - * /
+    int index = -1;               // where its value is kept in the log value lists
+    QHash<QString, int> refs;     // lower-case [name] -> log value index
+    bool valid = false;           // every [name] was found
+    int dec = 3;                  // decimals shown/logged
+};
+static QList<R36SMathChannel> r36sMathChannels;
+
+// R36S: warning limits (warn = Name > limit), by value id
+struct R36SWarn { QChar op; double limit; };
+static QHash<QString, R36SWarn> r36sWarnings;
+static QStringList r36sMathInputIds;   // ids logged only because a math channel uses them
+
 void r36sResetMinMax()
 {
     r36sMinMax.clear();
@@ -150,7 +197,8 @@ static QVector<int> r36sLogValueIndexes(FileActions::LogValuesStructure *lv, con
                 lv->log_value_protocol.at(j) == protocol &&
                 lv->log_value_enabled.at(j) == "1" &&
                 !lv->log_value_address.at(j).isEmpty() &&
-                lv->log_value_ecu_byte_index.at(j) != "ard")   // R36S: Arduino values are not asked from the ECU
+                 lv->log_value_ecu_byte_index.at(j) != "ard" &&   // R36S: Arduino values are not asked from the ECU
+                lv->log_value_ecu_byte_index.at(j) != "math")    // R36S: math channels are worked out here
             {
                 int len = qBound(1, lv->log_value_length.at(j).toInt(), 4);
                 if (used + len <= budget && !indexes.contains(j))
@@ -278,6 +326,12 @@ static void r36sWriteTemplate(const QString &path, FileActions::LogValuesStructu
            "#\n"
            "# extended_ecu_id = also load the extended values listed for this ECU ID\n"
            "#   (only for a tune built on that ROM - its RAM addresses must match)\n"
+           "#\n"
+           "# warn = Name > limit   (or <)  the box turns red while this is true\n"
+           "# math = Name | formula | unit   a calculated value (unit optional)\n"
+           "#   values in [brackets], + - * / numbers and ( ), and math names defined above it, e.g.\n"
+           "#   math = AFR Error | [Wideband AFR (Arduino)] / [A/F Sensor #1] | ratio\n"
+           "#   Values a math channel uses are logged to CSV with it.\n"
            "# Lines starting with # are ignored.\n\n";
     for (const QString &id : r36sFallbackDisplay(lv, protocol))
     {
@@ -285,7 +339,8 @@ static void r36sWriteTemplate(const QString &path, FileActions::LogValuesStructu
         if (j >= 0)
             out << "display = " << lv->log_value_name.at(j) << "\n";
     }
-    out << "\n# log = Mass Airflow\n# switch = Clutch Switch\n# extended_ecu_id = 134271823F\n";
+    out << "\n# log = Mass Airflow\n# switch = Clutch Switch\n# extended_ecu_id = 134271823F\n"
+           "# warn = Coolant Temperature > 220\n# math = Mass Airflow / Engine Speed | [Mass Airflow] / [Engine Speed]\n";
 }
 
 static void r36sWriteAvailable(const QString &path, FileActions::LogValuesStructure *lv, const QString &protocol,
@@ -313,7 +368,9 @@ static void r36sWriteAvailable(const QString &path, FileActions::LogValuesStruct
     {
         if (lv->log_value_protocol.at(j) != protocol || lv->log_value_enabled.at(j) != "1" || lv->log_value_address.at(j).isEmpty())
             continue;
-        QString line = lv->log_value_name.at(j) + "  [" + lv->log_value_id.at(j) + "]  (" + r36sUnit(lv, j) + ")";
+       QString line = lv->log_value_name.at(j) + "  [" + lv->log_value_id.at(j) + "]  (" + r36sUnit(lv, j) + ")";
+        if (lv->log_value_ecu_byte_index.at(j) == "math")
+            continue;   // R36S: listed below with their formulas
         if (lv->log_value_ecu_byte_index.at(j) == "ext")
             ext_lines.append(line);
         else
@@ -330,6 +387,10 @@ static void r36sWriteAvailable(const QString &path, FileActions::LogValuesStruct
     out << "== Standard values (" << std_lines.length() << ") ==\n" << std_lines.join("\n") << "\n\n";
     out << "== Extended values for this ECU ID (" << ext_lines.length() << ") ==\n" << ext_lines.join("\n") << "\n\n";
     out << "== Switches (" << sw_lines.length() << ") ==\n" << sw_lines.join("\n") << "\n";
+    // R36S: math channels, in log_setup.txt order
+    out << "\n== Math channels (" << r36sMathChannels.length() << ") ==\n";
+    for (const R36SMathChannel &m : r36sMathChannels)
+        out << m.name << " = " << m.formula << "  (" << m.unit << ")" << (m.valid ? "" : "  <- shows -- (see NOT FOUND)") << "\n";
 }
 
 // ===== R36S: Arduino (Nano) as an extra log device =====
@@ -759,7 +820,232 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
 }
 // ===== end R36S Arduino =====
 
+// ===== R36S: math channels and warnings =====
+// log_setup.txt:
+//   math = Name | formula | unit     e.g.  math = AFR Error | [Wideband AFR (Arduino)] / [A/F Sensor #1] | ratio
+//   warn = Name > limit   (or <)     e.g.  warn = Coolant Temperature > 220
+// A math channel is added to the log values like an Arduino value (never asked from the ECU),
+// so it can be shown in a box, logged to CSV, get min/max and a warning, and be graphed.
+// Simple channels made on the Math tab are written as  Name | [A] op [B]  with Name = "A op B".
+#include <QRegularExpression>
 
+static int r36sDecimals(FileActions::LogValuesStructure *lv, int j)
+{
+    QStringList c = lv->log_value_units.at(j).split(",");
+    if (c.length() < 4) return 2;
+    QStringList f = c.at(3).split(".");
+    return f.length() > 1 ? f.at(1).count('0') : 0;
+}
+
+static QString r36sMathOpText(QChar op) { return op == '*' ? QString("x") : QString(op); }
+
+static QString r36sMathAutoName(const QString &a, QChar op, const QString &b)
+{
+    return a + " " + r36sMathOpText(op) + " " + b;
+}
+
+// Split one math line (the text after "math =") into its parts
+static R36SMathChannel r36sMathParse(const QString &text)
+{
+    R36SMathChannel m;
+    QStringList parts = text.split('|');
+    m.name = parts.value(0).trimmed();
+    m.formula = parts.value(1).trimmed();
+    m.unit = parts.value(2).trimmed();
+    static const QRegularExpression simpleRe("^\\[([^\\]]+)\\]\\s*([-+*/])\\s*\\[([^\\]]+)\\]$");
+    QRegularExpressionMatch mt = simpleRe.match(m.formula);
+    if (mt.hasMatch() && parts.length() == 2)
+    {
+        QString a = mt.captured(1).trimmed(), b = mt.captured(3).trimmed();
+        QChar op = mt.captured(2).at(0);
+        if (m.name == r36sMathAutoName(a, op, b))
+        {
+            m.simple = true;
+            m.a = a; m.b = b; m.op = op;
+        }
+    }
+    return m;
+}
+
+// The log_setup.txt text for a simple channel
+static QString r36sMathSimpleLine(const QString &a, QChar op, const QString &b)
+{
+    return r36sMathAutoName(a, op, b) + " | [" + a + "] " + QString(op) + " [" + b + "]";
+}
+
+// Make the math channels from the "math =" lines, in file order. A channel can use
+// ECU/Arduino values and math channels above it. Names it can't find go to notFound.
+static void r36sMathBuild(FileActions::LogValuesStructure *lv, const QString &protocol,
+                          const QStringList &lines, QStringList &notFound)
+{
+    // Old channels are switched off first, so a formula only finds channels made above it
+    for (int j = 0; j < lv->log_value_id.length(); j++)
+        if (lv->log_value_protocol.at(j) == protocol && lv->log_value_ecu_byte_index.at(j) == "math")
+        {
+            lv->log_value_enabled.replace(j, "0");
+            lv->log_value.replace(j, "--");
+        }
+    r36sMathChannels.clear();
+
+    static const QRegularExpression nameRe("\\[([^\\]]*)\\]");
+    for (const QString &line : lines)
+    {
+        R36SMathChannel m = r36sMathParse(line);
+        if (m.name.isEmpty() || m.formula.isEmpty())
+        {
+            notFound.append("math = " + line + "   (needs  Name | formula)");
+            continue;
+        }
+        if (r36sFindValue(lv, protocol, m.name) >= 0)
+        {
+            notFound.append("math = " + line + "   (the name " + m.name + " is already used)");
+            continue;
+        }
+
+        // Find every [name] it uses
+        m.valid = true;
+        QRegularExpressionMatchIterator it = nameRe.globalMatch(m.formula);
+        while (it.hasNext())
+        {
+            QString n = it.next().captured(1).trimmed();
+            int j = r36sFindValue(lv, protocol, n);
+            if (j < 0)
+            {
+                notFound.append("math " + m.name + ": [" + n + "]");
+                m.valid = false;
+                continue;
+            }
+            m.refs.insert(n.toLower(), j);
+        }
+
+        // Simple channels: unit and decimals from the two values
+        if (m.simple && m.valid)
+        {
+            int ja = m.refs.value(m.a.toLower()), jb = m.refs.value(m.b.toLower());
+            QString ua = r36sUnit(lv, ja), ub = r36sUnit(lv, jb);
+            if (m.op == '+' || m.op == '-')
+            {
+                m.unit = ua.isEmpty() ? ub : ua;
+                m.dec = qMax(r36sDecimals(lv, ja), r36sDecimals(lv, jb));
+            }
+            else if (m.op == '*')
+                m.unit = ua.isEmpty() ? ub : (ub.isEmpty() ? ua : ua + "*" + ub);
+            else
+                m.unit = (ua == ub) ? QString("ratio") : (ub.isEmpty() ? ua : ua + "/" + ub);
+        }
+        m.unit.remove(',');   // a comma would break the units field
+
+        // Its place in the log value lists (kept between reloads so indexes stay put)
+        QString id = "MATH_" + m.name;
+        int j = -1;
+        for (int k = 0; k < lv->log_value_id.length(); k++)
+            if (lv->log_value_id.at(k) == id && lv->log_value_protocol.at(k) == protocol) { j = k; break; }
+        QString units = "conversion 0," + m.unit + ",x,0." + QString(m.dec, '0') + ",0,0,0";
+        if (j < 0)
+        {
+            lv->log_value_protocol.append(protocol);
+            lv->log_value_id.append(id);
+            lv->log_value_name.append(m.name);
+            lv->log_value_description.append("Math channel: " + m.formula);
+            lv->log_value_ecu_byte_index.append("math");   // not requested from the ECU
+            lv->log_value_ecu_bit.append("0");
+            lv->log_value_target.append("1");
+            lv->log_value_enabled.append("1");
+            lv->log_value.append("--");
+            lv->log_value_address.append("math");
+            lv->log_value_length.append("1");
+            lv->log_value_units.append(units);
+            lv->log_value_storagetype.append("");
+            lv->log_value_endian.append("big");
+            j = lv->log_value_id.length() - 1;
+        }
+        else
+        {
+            lv->log_value_description.replace(j, "Math channel: " + m.formula);
+            lv->log_value_units.replace(j, units);
+            lv->log_value_enabled.replace(j, "1");
+            lv->log_value.replace(j, "--");
+        }
+        m.index = j;
+        r36sMathChannels.append(m);
+    }
+}
+
+// Work out every math channel from the latest values (called after each ECU reply)
+static void r36sMathUpdate(FileActions::LogValuesStructure *lv)
+{
+    for (const R36SMathChannel &m : r36sMathChannels)
+    {
+        if (m.index < 0 || m.index >= lv->log_value.length())
+            continue;
+        bool ok = m.valid;
+        double v = 0;
+        if (ok)
+        {
+            std::function<double(const QString &, bool &)> lookup = [lv, &m](const QString &n, bool &good) {
+                good = false;
+                int j = m.refs.value(n.trimmed().toLower(), -1);
+                if (j < 0 || j >= lv->log_value.length())
+                    return 0.0;
+                return lv->log_value.at(j).toDouble(&good);   // "--" = no reading
+            };
+            v = r36sEvalMath(m.formula, lookup, ok);
+        }
+        if (!ok)
+        {
+            lv->log_value.replace(m.index, "--");   // left out of min/max and warnings
+            continue;
+        }
+        QString text = QString::number(v, 'f', m.dec);
+        lv->log_value.replace(m.index, text);
+        double shown = text.toDouble();
+        QHash<int, QPair<double, double> >::iterator mm = r36sMinMax.find(m.index);
+        if (mm == r36sMinMax.end())
+            r36sMinMax.insert(m.index, qMakePair(shown, shown));
+        else
+        {
+            mm.value().first = qMin(mm.value().first, shown);
+            mm.value().second = qMax(mm.value().second, shown);
+        }
+    }
+}
+
+// The math channel kept at a log value index, or nullptr
+static const R36SMathChannel *r36sMathAt(int j)
+{
+    for (const R36SMathChannel &m : r36sMathChannels)
+        if (m.index == j) return &m;
+    return nullptr;
+}
+
+// "Coolant Temperature > 220" -> warning for that value. False if it can't be read.
+static bool r36sWarnParse(FileActions::LogValuesStructure *lv, const QString &protocol, const QString &text)
+{
+    int pos = qMax(text.lastIndexOf('<'), text.lastIndexOf('>'));
+    if (pos <= 0)
+        return false;
+    bool ok = false;
+    double limit = text.mid(pos + 1).trimmed().toDouble(&ok);
+    int j = r36sFindValue(lv, protocol, text.left(pos));
+    if (!ok || j < 0)
+        return false;
+    r36sWarnings.insert(lv->log_value_id.at(j), R36SWarn{ text.at(pos), limit });
+    return true;
+}
+
+// True when the value is past its warning limit ("--" never is)
+static bool r36sWarnActive(FileActions::LogValuesStructure *lv, int j)
+{
+    QHash<QString, R36SWarn>::const_iterator w = r36sWarnings.constFind(lv->log_value_id.at(j));
+    if (w == r36sWarnings.constEnd())
+        return false;
+    bool ok = false;
+    double v = lv->log_value.at(j).toDouble(&ok);
+    if (!ok)
+        return false;
+    return w.value().op == '>' ? v > w.value().limit : v < w.value().limit;
+}
+// ===== end R36S math channels and warnings =====
 
 
 // Read log_setup.txt and set what is requested, shown and logged. Called on connect and when logging starts.
@@ -812,6 +1098,9 @@ void r36sApplyLogSetup(FileActions::LogValuesStructure *lv, const QString &proto
 
         notes << r36sArduinoUpdate(lv, protocol);   // R36S: Arduino values + port
 
+    // R36S: math channels must exist before display/log/warn names are matched
+    QStringList mathLines;
+
     for (const QPair<QString, QString> &e : entries)
     {
         {
@@ -834,7 +1123,15 @@ void r36sApplyLogSetup(FileActions::LogValuesStructure *lv, const QString &proto
                 if (!switches.contains(lv->log_switch_id.at(j)))
                     switches.append(lv->log_switch_id.at(j));
             }
+
+                        else if (kind == "warn")
+            {
+                if (!r36sWarnParse(lv, protocol, key))
+                    notFound.append(kind + " = " + key);
+            }
+
         }
+
     }
 
     if (display.isEmpty())
@@ -844,6 +1141,28 @@ void r36sApplyLogSetup(FileActions::LogValuesStructure *lv, const QString &proto
         for (const QString &id : display)
             logged.removeAll(id);
         notes << "log_setup.txt has no usable display lines - showing defaults. Add display = ... lines to choose.";
+    }
+
+    // R36S: values a shown/logged math channel uses are logged too (and math channels
+    // it uses, and theirs), so the math always has fresh inputs and the CSV shows them
+    QStringList all = display + logged;
+    r36sMathInputIds.clear();
+    for (int i = 0; i < all.length(); i++)
+    {
+        int j = r36sFindValue(lv, protocol, all.at(i));
+        const R36SMathChannel *m = j >= 0 ? r36sMathAt(j) : nullptr;
+        if (!m)
+            continue;
+        for (int ref : m->refs)
+        {
+            QString id = lv->log_value_id.at(ref);
+            if (!all.contains(id))
+            {
+                all.append(id);
+                logged.append(id);
+                r36sMathInputIds.append(id);
+            }
+        }
     }
 
     r36sDisplayIds = display;
@@ -908,6 +1227,16 @@ protected:
     }
 };
 
+// R36S: box border, red background while its warning is on
+static void r36sBoxStyle(QFrame *box, bool warn)
+{
+    if (box->property("r36s_warn").isValid() && box->property("r36s_warn").toBool() == warn)
+        return;   // unchanged: don't restyle every update
+    box->setProperty("r36s_warn", warn);
+    box->setStyleSheet("QFrame#" + box->objectName() + "{border:1px solid black;border-radius:5px;" +
+                       (warn ? "background-color:#ff3030;" : "") + "}");
+}
+
 static QWidget *r36sPanel(QWidget *area)
 {
     QWidget *panel = area->findChild<QWidget*>("r36sPanel");
@@ -930,7 +1259,7 @@ static QWidget *r36sPanel(QWidget *area)
     {
         QFrame *box = new QFrame(panel);
         box->setObjectName("r36sBox" + QString::number(i));
-        box->setStyleSheet("QFrame#r36sBox" + QString::number(i) + "{border:1px solid black;border-radius:5px;}");
+        r36sBoxStyle(box, false);
         QVBoxLayout *v = new QVBoxLayout(box);
         v->setContentsMargins(5, 2, 5, 2);
         v->setSpacing(0);
@@ -983,6 +1312,7 @@ void r36sPanelSetup(QWidget *area, FileActions::LogValuesStructure *lv, const QS
         box->findChild<QLabel*>("r36sTitle")->setText(index >= 0 ? lv->log_value_name.at(index) : QString());
         box->findChild<QLabel*>("r36sValue")->setText(index >= 0 ? "--" : QString());
         box->findChild<QLabel*>("r36sMinMax")->setText(QString());
+        r36sBoxStyle(box, false);   // R36S: no warning until a value arrives
     }
     r36sPanelFitFonts(panel);
 }
@@ -999,6 +1329,7 @@ void r36sPanelUpdate(QWidget *area, FileActions::LogValuesStructure *lv)
         if (!box) continue;
         int j = box->property("r36s_index").toInt();
         if (j < 0 || j >= lv->log_value.length()) continue;
+        r36sBoxStyle(box, r36sWarnActive(lv, j));   // R36S: red while past its warning limit
         QLabel *value = box->findChild<QLabel*>("r36sValue");
         int upx = value->property("r36s_unit_px").toInt();
         if (upx <= 0) upx = 10;
@@ -1181,8 +1512,15 @@ static double r36sRawValue(const QByteArray &data, int offset, int length, const
 #include <QFormLayout>
 #include <QMessageBox>
 
-// Rewrite the display/log/switch lines of log_setup.txt; comments and other lines stay
-static void r36sSaveLogSetup(const QStringList &display, const QStringList &logged, const QStringList &switches)
+#include <QDoubleSpinBox>
+#include <QHBoxLayout>
+#include <memory>
+
+static const int R36S_MATH_ROWS = 6;   // simple math channels on the Math tab
+
+// Rewrite the display/log/switch/warn/math lines of log_setup.txt; comments and other lines stay
+static void r36sSaveLogSetup(const QStringList &display, const QStringList &logged, const QStringList &switches,
+                             const QStringList &warns, const QStringList &maths)
 {
     QString path = QDir(R36S_FILES_DIR).filePath("log_setup.txt");
     QStringList kept;
@@ -1196,7 +1534,8 @@ static void r36sSaveLogSetup(const QStringList &display, const QStringList &logg
             QString t = line.trimmed();
             int eq = t.indexOf('=');
             QString kind = eq > 0 ? t.left(eq).trimmed().toLower() : QString();
-            if (!t.startsWith('#') && (kind == "display" || kind == "log" || kind == "switch"))
+            if (!t.startsWith('#') && (kind == "display" || kind == "log" || kind == "switch" ||
+                                       kind == "warn" || kind == "math"))
                 continue;
             kept.append(line);
         }
@@ -1210,12 +1549,15 @@ static void r36sSaveLogSetup(const QStringList &display, const QStringList &logg
     QTextStream os(&out);
     for (const QString &l : kept) os << l << "\n";
     os << "\n";
+    for (const QString &n : maths)    os << "math = " << n << "\n";   // first: display/log/warn can use them
     for (const QString &n : display)  os << "display = " << n << "\n";
     for (const QString &n : logged)   os << "log = " << n << "\n";
     for (const QString &n : switches) os << "switch = " << n << "\n";
+    for (const QString &n : warns)    os << "warn = " << n << "\n";
 }
 
-// Window to pick the 6 boxes, extra CSV values and switches. tab: 0 Display, 1 Log, 2 Switches.
+// Window to pick the 6 boxes (with warning limits), extra CSV values, switches and simple
+// math channels. tab: 0 Display, 1 Log, 2 Switches, 3 Math.
 // Returns true when OK was pressed (log_setup.txt saved and applied).
 bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, const QString &protocol, const QString &ecuid, int tab)
 {
@@ -1227,11 +1569,12 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
         return false;
     }
 
-    // What this ECU supports (known after Connect to ECU)
+    // What this ECU (and the Arduino) supports, known after Connect to ECU. Math channels are added separately.
     QStringList names, switchNames;
     for (int j = 0; j < lv->log_value_id.length(); j++)
         if (lv->log_value_protocol.at(j) == protocol && lv->log_value_enabled.at(j) == "1" &&
-            !lv->log_value_address.at(j).isEmpty() && !names.contains(lv->log_value_name.at(j)))
+            !lv->log_value_address.at(j).isEmpty() && lv->log_value_ecu_byte_index.at(j) != "math" &&
+            !names.contains(lv->log_value_name.at(j)))
             names.append(lv->log_value_name.at(j));
     for (int j = 0; j < lv->log_switch_id.length(); j++)
         if (lv->log_switch_protocol.at(j) == protocol && lv->log_switch_enabled.at(j) == "1" &&
@@ -1244,6 +1587,16 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
     }
     names.sort(Qt::CaseInsensitive);
     switchNames.sort(Qt::CaseInsensitive);
+
+    // Math channels from log_setup.txt: simple ones go in the Math tab rows, formulas are read-only
+    QList<R36SMathChannel> simpleIn, formulas;
+    for (const R36SMathChannel &m : r36sMathChannels)
+    {
+        if (m.simple && simpleIn.length() < R36S_MATH_ROWS)
+            simpleIn << m;
+        else
+            formulas << m;
+    }
 
     // Current selection, as names
     auto valueName = [lv, protocol](const QString &id) {
@@ -1259,8 +1612,18 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
     QStringList curDisplay, curLogged, curSwitches;
     for (const QString &id : r36sDisplayIds) curDisplay << valueName(id);
     for (const QString &id : lv->lower_panel_log_value_id)
-        if (!r36sDisplayIds.contains(id)) curLogged << valueName(id);
+        if (!r36sDisplayIds.contains(id) && !r36sMathInputIds.contains(id))   // math inputs are added by themselves
+            curLogged << valueName(id);
     for (const QString &id : lv->lower_panel_switch_id) curSwitches << switchName(id);
+
+    // Warnings, by value name: they follow the value if it moves to another box
+    std::shared_ptr<QHash<QString, R36SWarn> > warnByName = std::make_shared<QHash<QString, R36SWarn> >();
+    for (QHash<QString, R36SWarn>::const_iterator it = r36sWarnings.constBegin(); it != r36sWarnings.constEnd(); ++it)
+    {
+        QString n = valueName(it.key());
+        if (!n.isEmpty())
+            warnByName->insert(n, it.value());
+    }
 
     QDialog dlg(parent);
     dlg.setWindowTitle("Log values");
@@ -1269,22 +1632,138 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
     QTabWidget *tabs = new QTabWidget(&dlg);
     mainLayout->addWidget(tabs);
 
-    // Display: one dropdown per box
+    // ---- Math: up to 6 rows of  [value] [+ - x /] [value] ----
+    static const QChar MATH_OPS[4] = { '+', '-', '*', '/' };
+    QWidget *mathTab = new QWidget;
+    QVBoxLayout *mathLayout = new QVBoxLayout(mathTab);
+    QGridLayout *mathGrid = new QGridLayout;
+    mathGrid->setColumnStretch(1, 1);
+    mathGrid->setColumnStretch(3, 1);
+    QList<QComboBox*> mathA, mathOp, mathB;
+    for (int r = 0; r < R36S_MATH_ROWS; r++)
+    {
+        QComboBox *a = new QComboBox, *op = new QComboBox, *b = new QComboBox;
+        a->addItem("(off)"); a->addItems(names); a->setMaxVisibleItems(12);
+        b->addItem("(off)"); b->addItems(names); b->setMaxVisibleItems(12);
+        op->addItems({ "+", "-", "x", "/" });
+        if (r < simpleIn.length())
+        {
+            const R36SMathChannel &m = simpleIn.at(r);
+            if (a->findText(m.a) < 0) a->addItem(m.a);   // e.g. Arduino not connected: keep it anyway
+            if (b->findText(m.b) < 0) b->addItem(m.b);
+            a->setCurrentIndex(a->findText(m.a));
+            b->setCurrentIndex(b->findText(m.b));
+            for (int k = 0; k < 4; k++) if (MATH_OPS[k] == m.op) op->setCurrentIndex(k);
+        }
+        mathGrid->addWidget(new QLabel(QString::number(r + 1)), r, 0);
+        mathGrid->addWidget(a, r, 1);
+        mathGrid->addWidget(op, r, 2);
+        mathGrid->addWidget(b, r, 3);
+        mathA << a; mathOp << op; mathB << b;
+    }
+    mathLayout->addLayout(mathGrid);
+    QLabel *mathNote = new QLabel("Pick two values and a sign. The result can be shown in a box or logged; "
+                                  "both values are logged with it.");
+    mathNote->setWordWrap(true);
+    mathLayout->addWidget(mathNote);
+    if (!formulas.isEmpty())
+    {
+        mathLayout->addWidget(new QLabel("Made on the PC (edit log_setup.txt to change):"));
+        QListWidget *fl = new QListWidget;
+        fl->setSelectionMode(QAbstractItemView::NoSelection);
+        fl->setFocusPolicy(Qt::NoFocus);
+        for (const R36SMathChannel &m : formulas)
+            fl->addItem(m.name + " = " + m.formula + (m.valid ? QString() : QString("   (not found - shows --)")));
+        mathLayout->addWidget(fl, 1);
+    }
+    else
+        mathLayout->addStretch(1);
+
+    // Names of all math channels as they stand in the window right now
+    auto mathNames = [mathA, mathOp, mathB, formulas]() {
+        QStringList out;
+        for (int r = 0; r < mathA.length(); r++)
+            if (mathA.at(r)->currentIndex() > 0 && mathB.at(r)->currentIndex() > 0)
+            {
+                QString n = r36sMathAutoName(mathA.at(r)->currentText(), MATH_OPS[mathOp.at(r)->currentIndex()], mathB.at(r)->currentText());
+                if (!out.contains(n)) out << n;
+            }
+        for (const R36SMathChannel &m : formulas)
+            if (!out.contains(m.name)) out << m.name;
+        return out;
+    };
+
+    // ---- Display: one dropdown per box, plus its warning (off / < / >, limit) ----
     QWidget *displayTab = new QWidget;
     QFormLayout *form = new QFormLayout(displayTab);
-    QList<QComboBox*> boxes;
+    QList<QComboBox*> boxes, warnOps;
+    QList<QDoubleSpinBox*> warnLimits;
+    QStringList startMath = mathNames();
     for (int i = 0; i < R36S_MAX_DISPLAY; i++)
     {
         QComboBox *cb = new QComboBox;
         cb->addItem("(empty)");
         cb->addItems(names);
+        cb->addItems(startMath);
         cb->setMaxVisibleItems(12);
         int k = i < curDisplay.length() ? cb->findText(curDisplay.at(i)) : -1;
         cb->setCurrentIndex(k > 0 ? k : 0);
-        form->addRow(QString("Box %1 (%2, row %3)").arg(i + 1).arg(i % 2 == 0 ? "left" : "right").arg(i / 2 + 1), cb);
-        boxes << cb;
+
+        QComboBox *op = new QComboBox;
+        op->addItems({ "off", "<", ">" });
+        op->setToolTip("Box turns red while the value is below (<) or above (>) the limit");
+        QDoubleSpinBox *limit = new QDoubleSpinBox;
+        limit->setRange(-100000, 100000);
+        limit->setDecimals(2);
+        limit->setSingleStep(1);
+        limit->setMinimumWidth(90);
+
+        QWidget *row = new QWidget;
+        QHBoxLayout *h = new QHBoxLayout(row);
+        h->setContentsMargins(0, 0, 0, 0);
+        h->addWidget(cb, 1);
+        h->addWidget(op);
+        h->addWidget(limit);
+        form->addRow(QString("Box %1 (%2, row %3)").arg(i + 1).arg(i % 2 == 0 ? "left" : "right").arg(i / 2 + 1), row);
+        boxes << cb; warnOps << op; warnLimits << limit;
     }
     tabs->addTab(displayTab, "Display");
+
+    // Show the warning of the value now in box i
+    auto loadWarn = [boxes, warnOps, warnLimits, warnByName](int i) {
+        QComboBox *op = warnOps.at(i);
+        QDoubleSpinBox *limit = warnLimits.at(i);
+        QSignalBlocker b1(op), b2(limit);
+        bool has = boxes.at(i)->currentIndex() > 0;
+        QHash<QString, R36SWarn>::const_iterator w = warnByName->constFind(boxes.at(i)->currentText());
+        if (has && w != warnByName->constEnd())
+        {
+            op->setCurrentIndex(w.value().op == '<' ? 1 : 2);
+            limit->setValue(w.value().limit);
+        }
+        else
+            op->setCurrentIndex(0);
+        op->setEnabled(has);
+        limit->setEnabled(has && op->currentIndex() > 0);
+    };
+    // Keep the warning of the value in box i after op/limit changed
+    auto storeWarn = [boxes, warnOps, warnLimits, warnByName](int i) {
+        QString n = boxes.at(i)->currentText();
+        warnLimits.at(i)->setEnabled(boxes.at(i)->currentIndex() > 0 && warnOps.at(i)->currentIndex() > 0);
+        if (boxes.at(i)->currentIndex() <= 0)
+            return;
+        if (warnOps.at(i)->currentIndex() == 0)
+            warnByName->remove(n);
+        else
+            warnByName->insert(n, R36SWarn{ warnOps.at(i)->currentIndex() == 1 ? QChar('<') : QChar('>'), warnLimits.at(i)->value() });
+    };
+    for (int i = 0; i < R36S_MAX_DISPLAY; i++)
+    {
+        loadWarn(i);
+        QObject::connect(boxes.at(i), QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, [loadWarn, i](int) { loadWarn(i); });
+        QObject::connect(warnOps.at(i), QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, [storeWarn, i](int) { storeWarn(i); });
+        QObject::connect(warnLimits.at(i), QOverload<double>::of(&QDoubleSpinBox::valueChanged), &dlg, [storeWarn, i](double) { storeWarn(i); });
+    }
 
     // Log / Switches: tap a row to select or unselect it (highlighted = on)
     auto makeList = [](const QStringList &items, const QStringList &selected) {
@@ -1295,10 +1774,11 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
             list->item(r)->setSelected(selected.contains(list->item(r)->text()));
         return list;
     };
-    QListWidget *logList = makeList(names, curLogged);
+    QListWidget *logList = makeList(names + startMath, curLogged);
     QListWidget *switchList = makeList(switchNames, curSwitches);
     tabs->addTab(logList, "Log to CSV");
     tabs->addTab(switchList, "Switches");
+    tabs->addTab(mathTab, "Math");
 
     // R36S: values shown in the boxes are always logged, so on the Log to CSV tab they are
     // highlighted and locked (can't be unselected). Changing a box updates the list right away.
@@ -1329,9 +1809,41 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
         QObject::connect(cb, QOverload<int>::of(&QComboBox::currentIndexChanged), logList, [syncLog](int) { syncLog(); });
     syncLog();
 
-    tabs->setCurrentIndex(qBound(0, tab, 2));
+    // R36S: a math row changed - its new name is offered in the boxes and the Log to CSV list right away
+    auto refreshMath = [boxes, logList, names, mathNames, syncLog, loadWarn]() {
+        QStringList items = names + mathNames();
+        for (int i = 0; i < boxes.length(); i++)
+        {
+            QComboBox *cb = boxes.at(i);
+            QString cur = cb->currentIndex() > 0 ? cb->currentText() : QString();
+            {
+                QSignalBlocker block(cb);
+                cb->clear();
+                cb->addItem("(empty)");
+                cb->addItems(items);
+                int k = cur.isEmpty() ? 0 : cb->findText(cur);
+                cb->setCurrentIndex(k > 0 ? k : 0);
+            }
+            loadWarn(i);
+        }
+        QStringList selected;
+        for (int r = 0; r < logList->count(); r++)
+            if (logList->item(r)->isSelected() && (logList->item(r)->flags() & Qt::ItemIsEnabled))
+                selected << logList->item(r)->text();
+        logList->clear();
+        logList->addItems(items);
+        for (int r = 0; r < logList->count(); r++)
+            logList->item(r)->setSelected(selected.contains(logList->item(r)->text()));
+        syncLog();
+    };
+    for (int r = 0; r < R36S_MATH_ROWS; r++)
+        for (QComboBox *cb : { mathA.at(r), mathOp.at(r), mathB.at(r) })
+            QObject::connect(cb, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, [refreshMath](int) { refreshMath(); });
 
-    QLabel *note = new QLabel("Highlighted rows are logged. Light rows are shown in a box and always logged. Fewer values = faster updates.");
+    tabs->setCurrentIndex(qBound(0, tab, 3));
+
+    QLabel *note = new QLabel("Highlighted rows are logged. Light rows are shown in a box and always logged. "
+                              "A box turns red past its warning limit. Fewer values = faster updates.");
     note->setWordWrap(true);
     mainLayout->addWidget(note);
     QDialogButtonBox *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
@@ -1342,7 +1854,16 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
     if (dlg.exec() != QDialog::Accepted)
         return false;
 
-    QStringList display, logged, switches;
+    QStringList display, logged, switches, warns, maths;
+    for (int r = 0; r < R36S_MATH_ROWS; r++)
+        if (mathA.at(r)->currentIndex() > 0 && mathB.at(r)->currentIndex() > 0)
+        {
+            QString line = r36sMathSimpleLine(mathA.at(r)->currentText(), MATH_OPS[mathOp.at(r)->currentIndex()], mathB.at(r)->currentText());
+            if (!maths.contains(line)) maths << line;
+        }
+    for (const R36SMathChannel &m : formulas)
+        maths << (m.simple ? r36sMathSimpleLine(m.a, m.op, m.b)
+                           : m.name + " | " + m.formula + (m.unit.isEmpty() ? QString() : " | " + m.unit));
     for (QComboBox *cb : boxes)
         if (cb->currentIndex() > 0 && !display.contains(cb->currentText()))
             display << cb->currentText();
@@ -1352,8 +1873,14 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
     for (int r = 0; r < switchList->count(); r++)
         if (switchList->item(r)->isSelected())
             switches << switchList->item(r)->text();
+    for (const QString &n : display)   // warnings are kept for values shown in a box
+    {
+        QHash<QString, R36SWarn>::const_iterator w = warnByName->constFind(n);
+        if (w != warnByName->constEnd())
+            warns << n + " " + QString(w.value().op) + " " + QString::number(w.value().limit, 'g', 10);
+    }
 
-    r36sSaveLogSetup(display, logged, switches);
+    r36sSaveLogSetup(display, logged, switches, warns, maths);
     r36sApplyLogSetup(lv, protocol, ecuid);
     r36sResetMinMax();
     return true;
@@ -1884,6 +2411,7 @@ QString MainWindow::parse_log_params(QByteArray received, QString protocol)
 */
         //emit LOG_D(parse_message_to_hex(received), true, true);
         //emit LOG_D(" ", true, true);
+        r36sMathUpdate(logValues);   // R36S: math channels from the values just read
         logging_request_active = false;
         log_to_file();
     }
