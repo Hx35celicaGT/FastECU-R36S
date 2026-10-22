@@ -48,24 +48,49 @@ mkdir -p "$HOME" "$FASTECU_FILES"
 export QT_PLUGIN_PATH="$APPDIR/plugins"
 unset QT_QPA_PLATFORM_PLUGIN_PATH LD_LIBRARY_PATH LD_PRELOAD
 
-# ---------------------------------------------------------------------------
-# DISPLAY AND BUTTONS
-# TODO: copy these settings from the current R36S launcher (how the screen is
-# opened and how the buttons reach FastECU). Until then: draw straight to the
-# screen with linuxfb, which needs no graphics drivers.
-export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-linuxfb}"
-# ---------------------------------------------------------------------------
+
+# Display: draw straight to the screen (no graphics drivers needed)
+export QT_QPA_PLATFORM=linuxfb
+export QT_FONT_DPI=70
+umask 000
+
+run() {   # run a bundled program with the bundled libraries only
+    "$LOADER" --library-path "$APPDIR/lib" --argv0 "$(basename "$1")" "$@"
+}
 
 echo "Running from: $APPDIR"
-echo "Qt platform: $QT_QPA_PLATFORM"
 echo "----"
 
-# Start through the bundled loader, so the bundled C library is used too.
-# This is what makes it independent of the Arch R version on the card.
-"$LOADER" --library-path "$APPDIR/lib" --argv0 FastECU "$APPDIR/FastECU" --debug
+# Buttons: gamepad -> mouse/keyboard (hands off the sticks for the first second)
+GP=""
+if [ -f "$APPDIR/gamepad_mouse" ]; then
+    run "$APPDIR/gamepad_mouse" --speed 550 &
+    GP=$!
+    sleep 1
+else
+    echo "gamepad_mouse not in package: buttons will not work"
+fi
+
+cd "$APPDIR" || exit 1
+run "$APPDIR/FastECU" &
+FE=$!
+
+# Stop when either one ends:
+#  - FastECU closed normally (File -> Quit), or
+#  - SELECT + START held (quits gamepad_mouse) = emergency exit
+if [ -n "$GP" ]; then
+    wait -n $GP $FE
+else
+    wait $FE
+fi
 CODE=$?
 
+kill $GP $FE 2>/dev/null
+sleep 2
+kill -9 $FE 2>/dev/null
+wait 2>/dev/null
+
 echo "----"
-echo "FastECU exited with code $CODE at $(date)"
+echo "Stopped with code $CODE at $(date)"
 sync
 exit $CODE

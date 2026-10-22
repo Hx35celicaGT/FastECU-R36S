@@ -54,6 +54,9 @@ Turn on the R36S, go to Ports, start FastECU.
 Plug the OBD cable into the R36S with the OTG adapter, then into the car.
 Turn the ignition on.
 
+The sticks move the mouse pointer. To quit: File -> Quit.
+If FastECU stops responding, hold SELECT + START to force it closed.
+
 
 WHERE YOUR FILES ARE
 --------------------

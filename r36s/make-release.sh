@@ -54,6 +54,12 @@ mkdir -p "$PKG/app/lib" "$PKG/app/plugins" "$PKG/FastECU-Files" "$PKG/THIRD_PART
 cp "$CHROOT$APP/FastECU" "$PKG/app/FastECU"
 ELF_FILES=("$APP/FastECU")      # paths inside the chroot, for ldd
 
+# Gamepad -> mouse/keyboard helper (the buttons don't work without it)
+GAMEPAD="${GAMEPAD:-/root/r36s-input/gamepad_mouse}"
+[ -x "$CHROOT$GAMEPAD" ] || die "no gamepad_mouse at $CHROOT$GAMEPAD (set GAMEPAD=path inside the chroot)"
+cp "$CHROOT$GAMEPAD" "$PKG/app/gamepad_mouse"
+ELF_FILES+=("$GAMEPAD")
+
 for dir in $PLUGINS; do
     src="$CHROOT$QT_PLUGIN_DIR/$dir"
     [ -d "$src" ] || { echo "  (no Qt plugin folder $dir, skipped)"; continue; }
