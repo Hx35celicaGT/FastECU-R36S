@@ -331,6 +331,13 @@ private:
     void interpolate_value(QString action);
     void copy_value();
     void paste_value();
+        // Map window title-bar menu: Copy Table / Paste Table / Send To Graph (menu_actions.cpp)
+    void add_map_window_menu(QMdiSubWindow *subWindow);
+    void copy_table(QMdiSubWindow *subWindow);
+    void paste_table(QMdiSubWindow *subWindow);
+    void send_table_to_graph(QMdiSubWindow *subWindow, int mode);   // 0 = 2D/3D, 1 = X axis, 2 = Y axis
+    bool write_table_value(int rom_number, int map_number, int part, int index, QString text, QStringList &cell_text);
+        //MapWindowEnd
     int connect_to_ecu();
     void disconnect_from_ecu();
     void ecu_definition_manager();

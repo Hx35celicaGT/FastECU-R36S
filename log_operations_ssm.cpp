@@ -3311,6 +3311,414 @@ private:
 // ===== end R36S pointer =====
 
 
+// ===== R36S 2D / 3D graph (desktop 3) =====
+// A map window's title-bar menu (click the icon at its top-left) has "Send To 2D/3D Graph",
+// "Send X axis To 2D Graph" and "Send Y axis To 2D Graph". The table is drawn here as a picture
+// only: nothing on this page can be changed. Only one graph is shown; sending another replaces it.
+//   2D/3D:  a 3D map is drawn as a coloured surface; a map with one axis as a line.
+//   X axis: the map values against the X axis, one line for each Y row.
+//   Y axis: the map values against the Y axis, one line for each X column.
+#include <algorithm>
+
+struct R36SGraph
+{
+    int mode = -1;                  // -1 = nothing sent yet, 0 = surface, 1 = lines vs X, 2 = lines vs Y
+    QString title, file;
+    QString xName, yName, zName;    // axis names with units
+    QVector<double> x, y;           // axis positions (true values, or 0..n-1 for label axes)
+    QStringList xText, yText;       // axis labels as shown in the table
+    QVector<QVector<double> > z;    // z[row][col]: row = Y index, col = X index
+};
+static R36SGraph r36sGraph;
+
+// Same colours as the map table: low = red, high = blue
+static QColor r36sGraphColor(double t)
+{
+    t = qBound(0.0, t, 1.0);
+    QColor c;
+    c.setHsvF(t * (210.0 / 360.0), 0.85, 0.85);
+    return c;
+}
+
+static void r36sGraphRange(const R36SGraph &g, double &lo, double &hi)
+{
+    lo = DBL_MAX;
+    hi = -DBL_MAX;
+    for (const QVector<double> &row : g.z)
+        for (double v : row)
+        {
+            lo = qMin(lo, v);
+            hi = qMax(hi, v);
+        }
+    if (lo > hi) { lo = 0; hi = 1; }
+    if (hi - lo < 1e-9) { lo -= 1; hi += 1; }
+}
+
+static QString r36sGraphNum(double v, double span)
+{
+    int dec = span >= 100 ? 0 : span >= 10 ? 1 : span >= 1 ? 2 : 3;
+    return QString::number(v, 'f', dec);
+}
+
+// Draw labels along a line of points, skipping any that would overlap the last one drawn
+static void r36sGraphLabels(QPainter &p, const QVector<QPointF> &at, const QStringList &text, int align)
+{
+    QFontMetrics fm(p.font());
+    QRectF last;
+    for (int i = 0; i < at.size() && i < text.size(); i++)
+    {
+        QSizeF s(fm.horizontalAdvance(text.at(i)) + 4, fm.height());
+        QRectF r(at.at(i), s);
+        if (align & Qt::AlignHCenter) r.moveLeft(at.at(i).x() - s.width() / 2);
+        if (align & Qt::AlignRight)   r.moveRight(at.at(i).x());
+        if (align & Qt::AlignVCenter) r.moveTop(at.at(i).y() - s.height() / 2);
+        if (align & Qt::AlignBottom)  r.moveBottom(at.at(i).y());
+        if (i > 0 && i < at.size() - 1 && !last.isNull() && r.intersects(last))
+            continue;   // first and last labels are always drawn
+        if (i == at.size() - 1 && !last.isNull() && r.intersects(last))
+            continue;
+        p.drawText(r, Qt::AlignCenter, text.at(i));
+        last = r;
+    }
+}
+
+// Lines: values against one axis, one line for each step of the other axis
+static void r36sGraphPaintLines(QPainter &p, const QRect &area, const R36SGraph &g, const QPalette &pal)
+{
+    const bool vsX = g.mode == 1;
+    const QVector<double> &ax = vsX ? g.x : g.y;           // horizontal axis
+    const QStringList &axText = vsX ? g.xText : g.yText;
+    const QStringList &serText = vsX ? g.yText : g.xText;  // one line per step of this axis
+    const QString axName = vsX ? g.xName : g.yName;
+    const QString serName = vsX ? g.yName : g.xName;
+    const int nAx = ax.size();
+    const int nSer = vsX ? g.z.size() : (g.z.isEmpty() ? 0 : g.z.first().size());
+    if (nAx < 1 || nSer < 1)
+        return;
+
+    QFontMetrics fm(p.font());
+    double lo, hi;
+    r36sGraphRange(g, lo, hi);
+    double pad = (hi - lo) * 0.05;
+    lo -= pad;
+    hi += pad;
+    double axLo = ax.first(), axHi = ax.first();
+    for (double v : ax) { axLo = qMin(axLo, v); axHi = qMax(axHi, v); }
+    if (axHi - axLo < 1e-9) { axLo -= 1; axHi += 1; }
+
+    const int L = fm.horizontalAdvance("-00000.0") + 8;
+    const bool legend = nSer > 1;
+    const int R = legend ? fm.horizontalAdvance("00000.00") + 22 : 10;
+    const int B = fm.height() * 2 + 8;
+    QRect plot(area.x() + L, area.y() + fm.height() + 6, area.width() - L - R, area.height() - B - fm.height() - 6);
+    if (plot.width() < 20 || plot.height() < 20)
+        return;
+
+    auto px = [&](double v) { return plot.left() + (v - axLo) / (axHi - axLo) * plot.width(); };
+    auto py = [&](double v) { return plot.bottom() - (v - lo) / (hi - lo) * plot.height(); };
+
+    // grid: a line at each axis step, five value lines
+    p.setPen(QPen(pal.mid().color(), 1, Qt::DotLine));
+    QVector<QPointF> xt;
+    for (int i = 0; i < nAx; i++)
+    {
+        p.drawLine(QPointF(px(ax.at(i)), plot.top()), QPointF(px(ax.at(i)), plot.bottom()));
+        xt << QPointF(px(ax.at(i)), plot.bottom() + 3);
+    }
+    QVector<QPointF> yt;
+    QStringList ytText;
+    for (int i = 0; i <= 4; i++)
+    {
+        double v = lo + (hi - lo) * i / 4.0;
+        p.drawLine(QPointF(plot.left(), py(v)), QPointF(plot.right(), py(v)));
+        yt << QPointF(plot.left() - 4, py(v));
+        ytText << r36sGraphNum(v, hi - lo);
+    }
+    p.setPen(pal.text().color());
+    p.drawRect(plot.adjusted(0, 0, -1, -1));
+    r36sGraphLabels(p, xt, axText, Qt::AlignHCenter);
+    r36sGraphLabels(p, yt, ytText, Qt::AlignRight | Qt::AlignVCenter);
+    p.drawText(QRect(plot.left(), plot.bottom() + fm.height() + 4, plot.width(), fm.height() + 2), Qt::AlignCenter, axName);
+    p.drawText(QRect(area.x(), area.y(), area.width(), fm.height() + 2), Qt::AlignLeft | Qt::AlignVCenter, g.zName);
+    if (legend)
+        p.drawText(QRect(plot.right() + 6, area.y(), R - 6, fm.height() + 2), Qt::AlignLeft | Qt::AlignVCenter,
+                   fm.elidedText(serName, Qt::ElideRight, R - 6));
+
+    // one line per series, coloured low step = red .. high step = blue
+    QVector<QPointF> ends;
+    QStringList endText;
+    for (int s = 0; s < nSer; s++)
+    {
+        QColor c = nSer > 1 ? r36sGraphColor(double(s) / (nSer - 1)) : pal.highlight().color();
+        QPolygonF line;
+        for (int i = 0; i < nAx; i++)
+        {
+            double v = vsX ? g.z.at(s).value(i) : g.z.value(i).value(s);
+            line << QPointF(px(ax.at(i)), py(v));
+        }
+        p.setPen(QPen(c, 2));
+        p.drawPolyline(line);
+        p.setBrush(c);
+        if (nAx <= 32)
+            for (const QPointF &pt : line)
+                p.drawEllipse(pt, 2.0, 2.0);
+        p.setBrush(Qt::NoBrush);
+        if (legend)
+        {
+            ends << QPointF(plot.right() + 6, line.last().y());
+            endText << serText.value(s);
+        }
+    }
+    if (legend)
+    {
+        // series labels at the right end of each line, in the line's colour, no overlaps
+        QVector<int> order(ends.size());
+        for (int i = 0; i < order.size(); i++) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return ends.at(a).y() < ends.at(b).y(); });
+        double lastBottom = -1e9;
+        for (int k : order)
+        {
+            QRectF r(ends.at(k).x(), ends.at(k).y() - fm.height() / 2.0, R - 6, fm.height());
+            if (r.top() < lastBottom)
+                continue;
+            p.setPen(nSer > 1 ? r36sGraphColor(double(k) / (nSer - 1)) : pal.text().color());
+            p.drawText(r, Qt::AlignLeft | Qt::AlignVCenter, endText.at(k));
+            lastBottom = r.bottom();
+        }
+    }
+}
+
+// Surface: fixed view from the front-left, cells filled with the table colours
+static void r36sGraphPaintSurface(QPainter &p, const QRect &area, const R36SGraph &g, const QPalette &pal)
+{
+    const int ny = g.z.size();
+    const int nx = ny ? g.z.first().size() : 0;
+    if (nx < 2 || ny < 2)
+        return;
+    QFontMetrics fm(p.font());
+    double lo, hi;
+    r36sGraphRange(g, lo, hi);
+    double xLo = g.x.first(), xHi = g.x.first(), yLo = g.y.first(), yHi = g.y.first();
+    for (double v : g.x) { xLo = qMin(xLo, v); xHi = qMax(xHi, v); }
+    for (double v : g.y) { yLo = qMin(yLo, v); yHi = qMax(yHi, v); }
+    if (xHi - xLo < 1e-9) { xLo -= 1; xHi += 1; }
+    if (yHi - yLo < 1e-9) { yLo -= 1; yHi += 1; }
+
+    // world: u = X (0..1), v = Y (0..1, row 0 at the front), w = value (0..1)
+    const double az = -32.0 * M_PI / 180.0, el = 30.0 * M_PI / 180.0, zs = 0.75;
+    const double ca = cos(az), sa = sin(az), ce = cos(el), se = sin(el);
+    auto proj = [&](double u, double v, double w, double *depth) {
+        double x = u - 0.5, y = 0.5 - v, z = (w - 0.5) * zs;
+        double rx = x * ca - y * sa;
+        double ry = x * sa + y * ca;   // larger = nearer the viewer
+        if (depth) *depth = ry;
+        return QPointF(rx, ry * se - z * ce);
+    };
+    auto U = [&](int i) { return (g.x.at(i) - xLo) / (xHi - xLo); };
+    auto V = [&](int j) { return (g.y.at(j) - yLo) / (yHi - yLo); };
+    auto W = [&](double val) { return (val - lo) / (hi - lo); };
+
+    // fit the box (floor and top corners) into the drawing area, leaving room for labels
+    const int legendW = fm.horizontalAdvance("-00000.0") + 26;
+    QRectF room(area.x() + fm.horizontalAdvance("00000") + 8, area.y() + fm.height() + 6,
+                area.width() - legendW - fm.horizontalAdvance("00000") * 2 - 16, area.height() - fm.height() * 4 - 14);
+    if (room.width() < 40 || room.height() < 40)
+        return;
+    QRectF box;
+    for (int c = 0; c < 8; c++)
+    {
+        QPointF q = proj(c & 1, (c >> 1) & 1, (c >> 2) & 1, nullptr);
+        box = box.isNull() ? QRectF(q, QSizeF(1e-6, 1e-6)) : box.united(QRectF(q, QSizeF(1e-6, 1e-6)));
+    }
+    double sc = qMin(room.width() / box.width(), room.height() / box.height());
+    QPointF off = room.center() - box.center() * sc;
+    auto S = [&](double u, double v, double w) { return proj(u, v, w, nullptr) * sc + off; };
+
+    // floor and back walls
+    p.setPen(QPen(pal.mid().color(), 1));
+    p.setBrush(Qt::NoBrush);
+    QPolygonF floor;
+    floor << S(0, 0, 0) << S(1, 0, 0) << S(1, 1, 0) << S(0, 1, 0);
+    p.drawPolygon(floor);
+    p.setPen(QPen(pal.mid().color(), 1, Qt::DotLine));
+    for (int i = 0; i < nx; i++) p.drawLine(S(U(i), 0, 0), S(U(i), 1, 0));
+    for (int j = 0; j < ny; j++) p.drawLine(S(0, V(j), 0), S(1, V(j), 0));
+    p.drawLine(S(0, 1, 0), S(0, 1, 1));
+    p.drawLine(S(1, 1, 0), S(1, 1, 1));
+    for (int k = 1; k <= 4; k++)
+        p.drawLine(S(0, 1, k / 4.0), S(1, 1, k / 4.0));
+
+    // cells, far ones first
+    struct Cell { double depth; int i, j; };
+    QVector<Cell> cells;
+    for (int j = 0; j + 1 < ny; j++)
+        for (int i = 0; i + 1 < nx; i++)
+        {
+            double d = 0, t;
+            proj((U(i) + U(i + 1)) / 2, (V(j) + V(j + 1)) / 2, 0, &t);
+            d = t;
+            cells.append(Cell{ d, i, j });
+        }
+    std::sort(cells.begin(), cells.end(), [](const Cell &a, const Cell &b) { return a.depth < b.depth; });
+    for (const Cell &c : cells)
+    {
+        double a = g.z[c.j][c.i], b = g.z[c.j][c.i + 1], d = g.z[c.j + 1][c.i + 1], e = g.z[c.j + 1][c.i];
+        QPolygonF q;
+        q << S(U(c.i), V(c.j), W(a)) << S(U(c.i + 1), V(c.j), W(b))
+          << S(U(c.i + 1), V(c.j + 1), W(d)) << S(U(c.i), V(c.j + 1), W(e));
+        QColor fill = r36sGraphColor(W((a + b + d + e) / 4));
+        p.setBrush(fill);
+        p.setPen(QPen(fill.darker(150), 1));
+        p.drawPolygon(q);
+    }
+    p.setBrush(Qt::NoBrush);
+
+    // axis labels on the front edges
+    p.setPen(pal.text().color());
+    QVector<QPointF> xa, ya;
+    for (int i = 0; i < nx; i++) xa << S(U(i), 0, 0) + QPointF(0, 3);
+    for (int j = 0; j < ny; j++) ya << S(1, V(j), 0) + QPointF(4, 0);
+    r36sGraphLabels(p, xa, g.xText, Qt::AlignHCenter);
+    r36sGraphLabels(p, ya, g.yText, Qt::AlignLeft | Qt::AlignVCenter);
+    QString names = "X: " + (g.xName.isEmpty() ? QString("steps") : g.xName) + "     Y: " + (g.yName.isEmpty() ? QString("steps") : g.yName);
+    QRect caption(area.x(), area.bottom() - fm.height(), area.width() - legendW, fm.height() + 1);
+    p.drawText(caption, Qt::AlignHCenter | Qt::AlignVCenter, fm.elidedText(names, Qt::ElideRight, caption.width()));
+
+    // colour legend on the right
+    QRect bar(area.right() - legendW + 6, area.y() + fm.height() + 10, 12, area.height() - fm.height() * 2 - 24);
+    for (int yy = 0; yy < bar.height(); yy++)
+    {
+        p.setPen(r36sGraphColor(1.0 - double(yy) / qMax(1, bar.height() - 1)));
+        p.drawLine(bar.left(), bar.top() + yy, bar.right(), bar.top() + yy);
+    }
+    p.setPen(pal.text().color());
+    p.drawRect(bar.adjusted(0, 0, -1, -1));
+    for (int k = 0; k <= 4; k++)
+    {
+        double v = lo + (hi - lo) * k / 4.0;
+        int yy = bar.bottom() - qRound(double(bar.height() - 1) * k / 4.0);
+        p.drawText(QRect(bar.right() + 3, yy - fm.height() / 2, legendW - 20, fm.height()), Qt::AlignLeft | Qt::AlignVCenter, r36sGraphNum(v, hi - lo));
+    }
+    p.drawText(QRect(area.x(), area.y(), area.width(), fm.height() + 2), Qt::AlignRight | Qt::AlignVCenter, g.zName);
+}
+
+static void r36sGraphPaint(QPainter &p, const QRect &r, const R36SGraph &g, const QPalette &pal)
+{
+    p.fillRect(r, pal.base());
+    p.setRenderHint(QPainter::Antialiasing, true);
+    QFont f = p.font();
+    QFontMetrics fm(f);
+    if (g.mode < 0)
+    {
+        p.setPen(pal.text().color());
+        p.drawText(r, Qt::AlignCenter,
+                   "2D / 3D\n\nNo graph yet\n\n"
+                   "On a map window click the icon at its top left\n"
+                   "and pick Send To 2D/3D Graph\n\nL1 / R1: switch desktops");
+        return;
+    }
+    QFont bold = f;
+    bold.setBold(true);
+    p.setFont(bold);
+    p.setPen(pal.text().color());
+    static const char *what[] = { "", "  -  X axis", "  -  Y axis" };
+    QRect head(r.x() + 6, r.y() + 2, r.width() - 12, fm.height() + 4);
+    p.drawText(head, Qt::AlignLeft | Qt::AlignVCenter,
+               QFontMetrics(bold).elidedText(g.title + what[qBound(0, g.mode, 2)], Qt::ElideRight, head.width()));
+    p.setFont(f);
+    QRect area = r.adjusted(6, fm.height() + 8, -6, -4);
+    if (g.mode == 0)
+        r36sGraphPaintSurface(p, area, g, pal);
+    else
+        r36sGraphPaintLines(p, area, g, pal);
+}
+
+static QPointer<R36SPaintBox> r36sGraphView;
+
+static QWidget *r36sGraphViewCreate(QWidget *parent)
+{
+    R36SPaintBox *box = new R36SPaintBox(parent);
+    box->setFocusPolicy(Qt::StrongFocus);   // the page takes the keys so L1 / R1 still switch
+    box->onPaint = [box](QPainter &p, const QRect &r) { r36sGraphPaint(p, r, r36sGraph, box->palette()); };
+    r36sGraphView = box;
+    return box;
+}
+// ===== end R36S 2D / 3D graph =====
+```
+
+When done, the line `// ===== R36S desktops (L1 / R1) =====` should sit right after `// ===== end R36S 2D / 3D graph =====` (a blank line between is fine).
+
+### Edit 5 - put the graph page on desktop 3 (the only replace)
+
+`Ctrl+F` and search for: `r36sCsvViewerCreate(stack)`. You'll land on these three lines inside `r36sDesktopOverlay()`:
+
+```cpp
+            QWidget *page = i == 1 ? r36sCsvViewerCreate(stack) : new QWidget(stack);   // desktop 2 = CSV viewer
+            if (i != 1)
+                r36sDesktopBuild(i, page);
+```
+
+Select exactly those three lines (click at the start of the first, `Shift`+click at the end of the third) and paste this in their place:
+
+```cpp
+            QWidget *page;
+            if (i == 1)
+                page = r36sCsvViewerCreate(stack);       // desktop 2 = CSV viewer
+            else if (i == 2)
+                page = r36sGraphViewCreate(stack);       // desktop 3 = 2D / 3D graph
+            else
+            {
+                page = new QWidget(stack);
+                r36sDesktopBuild(i, page);
+            }
+```
+
+The lines just after it, `stack->addWidget(page);` and the closing `}`, stay as they are.
+
+### Edit 6 - the send function
+
+`Ctrl+F` and search for: `// ===== end R36S desktops =====` (near the end of the file).
+
+Press `Home`, `Enter`, up arrow, so you're on a new empty line just above it, then paste:
+
+```cpp
+// R36S: called from a map window's "Send To ... Graph" menu (menu_actions.cpp).
+// mode 0 = 2D/3D, 1 = X axis, 2 = Y axis. z[row][col] uses row = Y step, col = X step.
+// Replaces whatever graph was there and switches to desktop 3 (2D / 3D).
+void r36sGraphShow(int mode, const QString &title, const QString &file,
+                   const QString &xName, const QString &yName, const QString &zName,
+                   const QVector<double> &x, const QVector<double> &y,
+                   const QStringList &xText, const QStringList &yText,
+                   const QVector<QVector<double> > &z)
+{
+    R36SGraph g;
+    g.title = title;
+    g.file = file;
+    g.xName = xName;
+    g.yName = yName;
+    g.zName = zName;
+    g.x = x;
+    g.y = y;
+    g.xText = xText;
+    g.yText = yText;
+    g.z = z;
+    int nx = x.size(), ny = y.size();
+    if (mode == 0)
+        g.mode = (nx > 1 && ny > 1) ? 0 : (nx > 1 ? 1 : 2);   // one axis only: a single line
+    else
+        g.mode = mode;
+    r36sGraph = g;
+    if (r36sGraphView)
+        r36sGraphView->update();
+
+    if (r36sEcuBusy)
+        return;                                 // never switch desktops during a ROM read / write
+    int current = r36sDesktopIndexOf(QApplication::activeWindow());
+    r36sDesktopShow(current < 0 ? 0 : current, 2);
+    if (r36sGraphView)
+        r36sGraphView->update();
+}
+
 
 // ===== R36S desktops (L1 / R1) =====
 // L1 and R1 send Shift+Tab and Tab. On the FastECU screen and on the other desktops they

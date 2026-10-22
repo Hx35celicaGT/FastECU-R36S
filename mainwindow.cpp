@@ -1924,6 +1924,7 @@ void MainWindow::calibration_data_treewidget_item_selected(QTreeWidgetItem* item
                         connect(calibrationMaps, SIGNAL(selectable_combobox_item_changed(QString)), this, SLOT(selectable_combobox_item_changed(QString)));
                         connect(calibrationMaps, SIGNAL(checkbox_state_changed(int)), this, SLOT(checkbox_state_changed(int)));
                         connect(subWindow, SIGNAL(destroyed(QObject*)), this, SLOT(close_calibration_map(QObject*)));
+                        add_map_window_menu(subWindow);   // Copy Table / Paste Table / Send To Graph
                     }
                 }
             }

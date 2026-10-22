@@ -1749,3 +1749,409 @@ int MainWindow::simulate_obd()
 
     return 0;
 }
+
+
+// ===== Map window title-bar menu: Copy Table / Paste Table / Send To Graph =====
+// Clicking the icon at the top left of a map window opens its menu (Restore, Move, Size,
+// Minimize, Maximize, Stay on Top, Close). These items are added above them for 2D and 3D maps.
+
+// R36S: defined in log_operations_ssm.cpp
+void r36sGraphShow(int mode, const QString &title, const QString &file,
+                   const QString &xName, const QString &yName, const QString &zName,
+                   const QVector<double> &x, const QVector<double> &y,
+                   const QStringList &xText, const QStringList &yText,
+                   const QVector<QVector<double> > &z);
+
+namespace {
+// Where the parts of a 2D / 3D map sit in its table widget (same rules as CalibrationMaps)
+struct MapTableLayout
+{
+    int xs = 0, ys = 0;          // map data size: X columns, Y rows
+    int xOff = 0, yOff = 0;      // data starts at table column xOff, row yOff
+    bool staticAxis = false;     // X header holds fixed text labels
+    bool xAxis = false;          // X header holds values stored in the ROM (can be pasted)
+    bool yAxis = false;          // Y header holds values stored in the ROM (can be pasted)
+};
+
+MapTableLayout mapTableLayout(FileActions::EcuCalDefStructure *def, int map)
+{
+    MapTableLayout l;
+    l.xs = def->XSizeList.at(map).toInt();
+    l.ys = def->YSizeList.at(map).toInt();
+    QString xType = def->XScaleTypeList.at(map);
+    l.staticAxis = xType == "Static Y Axis" || xType == "Static X Axis";
+    l.xOff = l.ys > 1 ? 1 : 0;
+    l.yOff = (l.xs > 1 || l.staticAxis) ? 1 : 0;
+    l.xAxis = l.xs > 1 && !l.staticAxis && def->XScaleAddressList.at(map).trimmed() != "";
+    l.yAxis = l.ys > 1 && !l.staticAxis && def->YScaleAddressList.at(map).trimmed() != "";
+    return l;
+}
+
+// Clipboard text -> rows of cells. Tabs (Excel / FastECU) first, then commas, then spaces.
+QList<QStringList> parseTableText(QString text)
+{
+    text.replace("\r\n", "\n").replace('\r', '\n');
+    QStringList lines = text.split('\n');
+    while (!lines.isEmpty() && lines.last().trimmed().isEmpty())
+        lines.removeLast();
+    QList<QStringList> rows;
+    bool tabs = text.contains('\t');
+    bool commas = !tabs && text.contains(',');
+    for (const QString &line : lines)
+    {
+        QStringList cells;
+        if (tabs)
+            cells = line.split('\t');
+        else if (commas)
+            cells = line.split(',');
+        else
+#if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
+            cells = line.simplified().split(' ', Qt::SkipEmptyParts);
+#else
+            cells = line.simplified().split(' ', QString::SkipEmptyParts);
+#endif
+        for (QString &c : cells)
+            c = c.trimmed();
+        rows.append(cells);
+    }
+    return rows;
+}
+}
+
+void MainWindow::add_map_window_menu(QMdiSubWindow *subWindow)
+{
+    QStringList name = subWindow->objectName().split(",");
+    if (name.count() < 2)
+        return;
+    int rom_number = name.at(0).toInt();
+    int map_number = name.at(1).toInt();
+    QString type = ecuCalDef[rom_number]->TypeList.at(map_number);
+    if (type != "2D" && type != "3D")
+        return;                                 // switches, selectables and 1D values keep the plain menu
+
+    QMenu *menu = subWindow->systemMenu();
+    if (!menu)
+        return;
+    QAction *first = menu->actions().isEmpty() ? nullptr : menu->actions().first();
+    QAction *copyAct = new QAction("Copy Table", menu);
+    QAction *pasteAct = new QAction("Paste Table", menu);
+    QAction *graphAct = new QAction("Send To 2D/3D Graph", menu);
+    QAction *xAct = new QAction("Send X axis To 2D Graph", menu);
+    QAction *yAct = new QAction("Send Y axis To 2D Graph", menu);
+    menu->insertAction(first, copyAct);
+    menu->insertAction(first, pasteAct);
+    menu->insertSeparator(first);
+    menu->insertAction(first, graphAct);
+    menu->insertAction(first, xAct);
+    menu->insertAction(first, yAct);
+    menu->insertSeparator(first);
+
+    MapTableLayout l = mapTableLayout(ecuCalDef[rom_number], map_number);
+    xAct->setEnabled(l.xAxis);                  // only when the header holds numbers (RPM, load, MAF volts ...)
+    yAct->setEnabled(l.yAxis);
+    connect(menu, &QMenu::aboutToShow, pasteAct, [pasteAct]() {
+        pasteAct->setEnabled(!QApplication::clipboard()->text().trimmed().isEmpty());
+    });
+
+    connect(copyAct, &QAction::triggered, this, [this, subWindow]() { copy_table(subWindow); });
+    connect(pasteAct, &QAction::triggered, this, [this, subWindow]() { paste_table(subWindow); });
+    connect(graphAct, &QAction::triggered, this, [this, subWindow]() { send_table_to_graph(subWindow, 0); });
+    connect(xAct, &QAction::triggered, this, [this, subWindow]() { send_table_to_graph(subWindow, 1); });
+    connect(yAct, &QAction::triggered, this, [this, subWindow]() { send_table_to_graph(subWindow, 2); });
+}
+
+// Whole table, X header row and Y header column included, as tab separated text
+// (pastes straight into Excel / LibreOffice and back into another FastECU map of the same size)
+void MainWindow::copy_table(QMdiSubWindow *subWindow)
+{
+    QTableWidget *table = subWindow->findChild<QTableWidget*>(subWindow->objectName());
+    if (!table)
+        return;
+    QStringList lines;
+    for (int row = 0; row < table->rowCount(); row++)
+    {
+        QStringList cells;
+        for (int col = 0; col < table->columnCount(); col++)
+        {
+            QTableWidgetItem *item = table->item(row, col);
+            cells << (item ? item->text() : QString());
+        }
+        lines << cells.join('\t');
+    }
+    QApplication::clipboard()->setText(lines.join("\r\n") + "\r\n");
+    emit LOG_I("Copied table " + subWindow->objectName().split(",").value(2) + " ("
+               + QString::number(table->columnCount()) + " x " + QString::number(table->rowCount()) + ")", true, true);
+}
+
+// One value into the ROM, converted and limited the same way as Set value.
+// part: 0 = map data, 1 = X axis, 2 = Y axis. cell_text is the matching data list, updated here.
+bool MainWindow::write_table_value(int rom_number, int map_number, int part, int index, QString text, QStringList &cell_text)
+{
+    union map_data{
+        int8_t sbyte_value[4];
+        int16_t sword_value[2];
+        int32_t sdword_value;
+        uint8_t byte_value[4];
+        uint16_t word_value[2];
+        uint32_t dword_value;
+        float float_value;
+    } map_data_value;
+
+    FileActions::EcuCalDefStructure *def = ecuCalDef[rom_number];
+    bool ok = false;
+    text = text.trimmed();
+    text.replace(",", ".");
+    float map_item_value = text.toFloat(&ok);
+    if (!ok || index < 0 || index >= cell_text.count())
+        return false;
+
+    QString to_byte = def->ToByteList[map_number];
+    QString from_byte = def->FromByteList[map_number];
+    QString storagetype = def->StorageTypeList[map_number];
+    QString endian = def->EndianList[map_number];
+    QString min_value = def->MinValueList[map_number];
+    QString max_value = def->MaxValueList[map_number];
+    QString address = def->AddressList[map_number];
+    if (part == 1)
+    {
+        to_byte = def->XScaleToByteList[map_number];
+        from_byte = def->XScaleFromByteList[map_number];
+        storagetype = def->XScaleStorageTypeList[map_number];
+        endian = def->XScaleEndianList[map_number];
+        min_value = def->XScaleMinValueList[map_number];
+        max_value = def->XScaleMaxValueList[map_number];
+        address = def->XScaleAddressList[map_number];
+    }
+    else if (part == 2)
+    {
+        to_byte = def->YScaleToByteList[map_number];
+        from_byte = def->YScaleFromByteList[map_number];
+        storagetype = def->YScaleStorageTypeList[map_number];
+        endian = def->YScaleEndianList[map_number];
+        min_value = def->YScaleMinValueList[map_number];
+        max_value = def->YScaleMaxValueList[map_number];
+        address = def->YScaleAddressList[map_number];
+    }
+    bool bStatus = false;
+    uint32_t data_address = address.toUInt(&bStatus, 16);
+    if (!bStatus)
+        return false;
+
+    if (min_value != " " && map_item_value < min_value.toFloat())
+        map_item_value = min_value.toFloat();
+    if (max_value != " " && map_item_value > max_value.toFloat())
+        map_item_value = max_value.toFloat();
+
+    QString rom_data_value = QString::number(fileActions->calculate_value_from_expression(fileActions->parse_stringlist_from_expression_string(to_byte, QString::number(map_item_value))));
+    if (storagetype == "float")
+    {
+        map_data_value.float_value = rom_data_value.toFloat();
+    }
+    else
+    {
+        // keep the raw value inside what the storage type can hold
+        double raw = qRound64(rom_data_value.toDouble());
+        double raw_min = 0, raw_max = 255;
+        if (storagetype == "uint16") raw_max = 65535;
+        else if (storagetype == "uint24") raw_max = 16777215;
+        else if (storagetype == "uint32") raw_max = 4294967295.0;
+        else if (storagetype == "int8")  { raw_min = -128; raw_max = 127; }
+        else if (storagetype == "int16") { raw_min = -32768; raw_max = 32767; }
+        else if (storagetype == "int24") { raw_min = -8388608; raw_max = 8388607; }
+        else if (storagetype == "int32") { raw_min = -2147483648.0; raw_max = 2147483647.0; }
+        raw = qBound(raw_min, raw, raw_max);
+        rom_data_value = QString::number((qint64)raw);
+        map_data_value.dword_value = storagetype.startsWith("uint") ? (uint32_t)(quint64)raw : (uint32_t)(int32_t)(qint64)raw;
+    }
+    map_item_value = fileActions->calculate_value_from_expression(fileActions->parse_stringlist_from_expression_string(from_byte, rom_data_value));
+    cell_text.replace(index, QString::number(map_item_value));
+    set_rom_data_value(rom_number, data_address, index, storagetype, endian, map_data_value.float_value);
+    return true;
+}
+
+// Paste a table copied with Copy Table (or from a spreadsheet) into this map.
+// Accepted: the whole table with its headers (same size as this one), or the values only.
+// Headers are written too when this map's axis is stored in the ROM; text labels are left alone.
+void MainWindow::paste_table(QMdiSubWindow *subWindow)
+{
+    QStringList name = subWindow->objectName().split(",");
+    int rom_number = name.at(0).toInt();
+    int map_number = name.at(1).toInt();
+    FileActions::EcuCalDefStructure *def = ecuCalDef[rom_number];
+    QTableWidget *table = subWindow->findChild<QTableWidget*>(subWindow->objectName());
+    if (!table)
+        return;
+
+    MapTableLayout l = mapTableLayout(def, map_number);
+    QList<QStringList> rows = parseTableText(QApplication::clipboard()->text());
+    int pasteRows = rows.count();
+    int pasteCols = 0;
+    for (const QStringList &r : rows)
+        pasteCols = qMax(pasteCols, r.count());
+
+    bool withHeaders = pasteRows == l.ys + l.yOff && pasteCols == l.xs + l.xOff;
+    bool valuesOnly = !withHeaders && pasteRows == l.ys && pasteCols == l.xs;
+    if (!withHeaders && !valuesOnly)
+    {
+        QMessageBox::warning(this, tr("Paste Table"),
+                             QString("The copied table does not match this map.\n\n"
+                                     "Copied: %1 columns x %2 rows\n"
+                                     "This map: %3 x %4 with headers, or %5 x %6 values only")
+                             .arg(pasteCols).arg(pasteRows)
+                             .arg(l.xs + l.xOff).arg(l.ys + l.yOff).arg(l.xs).arg(l.ys));
+        return;
+    }
+    int r0 = withHeaders ? l.yOff : 0;
+    int c0 = withHeaders ? l.xOff : 0;
+    auto cell = [&](int r, int c) { return c < rows.at(r).count() ? rows.at(r).at(c) : QString(); };
+
+    // check every value before anything is written
+    for (int j = 0; j < l.ys; j++)
+        for (int i = 0; i < l.xs; i++)
+        {
+            bool ok = false;
+            QString t = cell(r0 + j, c0 + i);
+            t.replace(",", ".").toFloat(&ok);
+            if (!ok)
+            {
+                QMessageBox::warning(this, tr("Paste Table"),
+                                     QString("Value at column %1, row %2 is not a number: \"%3\"\n\nNothing was pasted.")
+                                     .arg(c0 + i + 1).arg(r0 + j + 1).arg(cell(r0 + j, c0 + i)));
+                return;
+            }
+        }
+    bool pasteX = withHeaders && l.xAxis && l.yOff == 1;
+    bool pasteY = withHeaders && l.yAxis && l.xOff == 1;
+
+    QString what = QString("%1 x %2 values").arg(l.xs).arg(l.ys);
+    if (pasteX && pasteY) what += " and both axes";
+    else if (pasteX) what += " and the X axis";
+    else if (pasteY) what += " and the Y axis";
+    if (QMessageBox::question(this, tr("Paste Table"),
+                              "Paste " + what + " into\n" + def->NameList.at(map_number) + " ?",
+                              QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+        return;
+
+    QStringList data = def->MapData.at(map_number).split(",");
+    for (int j = 0; j < l.ys; j++)
+        for (int i = 0; i < l.xs; i++)
+            write_table_value(rom_number, map_number, 0, j * l.xs + i, cell(r0 + j, c0 + i), data);
+    def->MapData.replace(map_number, data.join(","));
+
+    if (pasteX)
+    {
+        QStringList xData = def->XScaleData.at(map_number).split(",");
+        for (int i = 0; i < l.xs; i++)
+            write_table_value(rom_number, map_number, 1, i, cell(0, l.xOff + i), xData);   // not a number: left as it is
+        def->XScaleData.replace(map_number, xData.join(","));
+    }
+    if (pasteY)
+    {
+        QStringList yData = def->YScaleData.at(map_number).split(",");
+        for (int j = 0; j < l.ys; j++)
+            write_table_value(rom_number, map_number, 2, j, cell(l.yOff + j, 0), yData);
+        def->YScaleData.replace(map_number, yData.join(","));
+    }
+
+    // new colour range for the new values, then redraw this map
+    float lo = data.value(0).toFloat(), hi = lo;
+    for (int k = 0; k < l.xs * l.ys && k < data.count(); k++)
+    {
+        lo = qMin(lo, data.at(k).toFloat());
+        hi = qMax(hi, data.at(k).toFloat());
+    }
+    def->MapCellColorMin[map_number] = QString::number(lo);
+    def->MapCellColorMax[map_number] = QString::number(hi);
+    ui->mdiArea->setActiveSubWindow(subWindow);
+    set_maptablewidget_items();
+    emit LOG_I("Pasted table into " + def->NameList.at(map_number), true, true);
+}
+
+// Send this map to the 2D / 3D desktop. mode 0 = 2D/3D, 1 = X axis, 2 = Y axis
+void MainWindow::send_table_to_graph(QMdiSubWindow *subWindow, int mode)
+{
+    QStringList name = subWindow->objectName().split(",");
+    int rom_number = name.at(0).toInt();
+    int map_number = name.at(1).toInt();
+    FileActions::EcuCalDefStructure *def = ecuCalDef[rom_number];
+    QTableWidget *table = subWindow->findChild<QTableWidget*>(subWindow->objectName());
+    if (!table)
+        return;
+    MapTableLayout l = mapTableLayout(def, map_number);
+    if (l.xs < 1 || l.ys < 1)
+        return;
+
+    QStringList data = def->MapData.at(map_number).split(",");
+    QVector<QVector<double> > z(l.ys, QVector<double>(l.xs, 0.0));
+    for (int j = 0; j < l.ys; j++)
+        for (int i = 0; i < l.xs; i++)
+            z[j][i] = data.value(j * l.xs + i).toDouble();
+
+    // axis positions: the stored values when they are numbers, otherwise step 0, 1, 2 ...
+    // axis labels: the header text exactly as the table shows it
+    QVector<double> x, y;
+    QStringList xText, yText;
+    QStringList xData = def->XScaleData.at(map_number).split(",");
+    QStringList yData = def->YScaleData.at(map_number).split(",");
+    bool xNum = l.xAxis, yNum = l.yAxis;
+    for (int i = 0; i < l.xs && xNum; i++) { bool ok; xData.value(i).toDouble(&ok); xNum = ok; }
+    for (int j = 0; j < l.ys && yNum; j++) { bool ok; yData.value(j).toDouble(&ok); yNum = ok; }
+    if (l.xs > 1)
+        for (int i = 0; i < l.xs; i++)
+        {
+            QTableWidgetItem *item = table->item(0, l.xOff + i);
+            x << (xNum ? xData.at(i).toDouble() : double(i));
+            xText << (item ? item->text() : QString::number(i));
+        }
+    if (l.ys > 1)
+        for (int j = 0; j < l.ys; j++)
+        {
+            QTableWidgetItem *item = table->item(l.yOff + j, 0);
+            y << (yNum ? yData.at(j).toDouble() : double(j));
+            yText << (item ? item->text() : QString::number(j));
+        }
+
+    auto axisTitle = [](const QString &n, const QString &u) {
+        QString a = n.trimmed(), b = u.trimmed();
+        return b.isEmpty() ? a : (a.isEmpty() ? b : a + " (" + b + ")");
+    };
+    QString xName = axisTitle(def->XScaleNameList.at(map_number), def->XScaleUnitsList.at(map_number));
+    QString yName = axisTitle(def->YScaleNameList.at(map_number), def->YScaleUnitsList.at(map_number));
+    QString zName = map_number < def->UnitsList.count() ? def->UnitsList.at(map_number).trimmed() : QString();
+
+    if (mode == 1 || mode == 2)
+    {
+        // Send X / Y axis: only that header's values (RPM, load, MAF volts ...) against step 1, 2, 3 ...
+        bool numeric = mode == 1 ? xNum : yNum;
+        const QVector<double> &head = mode == 1 ? x : y;
+        if (!numeric || head.isEmpty())
+        {
+            QMessageBox::information(this, tr("Send To Graph"), "This header has no values stored in the ROM to graph.");
+            return;
+        }
+        QVector<double> steps;
+        QStringList stepText;
+        QVector<QVector<double> > hz;
+        for (int k = 0; k < head.size(); k++)
+        {
+            steps << k + 1;
+            stepText << QString::number(k + 1);
+        }
+        if (mode == 1)
+            hz << head;                                     // one row: the X header
+        else
+            for (double v : head)
+                hz << QVector<double>(1, v);                // one column: the Y header
+        QString headName = mode == 1 ? xName : yName;
+        if (mode == 1)
+            r36sGraphShow(1, def->NameList.at(map_number), def->FileName, "Step", "", headName,
+                          steps, QVector<double>(), stepText, QStringList(), hz);
+        else
+            r36sGraphShow(2, def->NameList.at(map_number), def->FileName, "", "Step", headName,
+                          QVector<double>(), steps, QStringList(), stepText, hz);
+        return;
+    }
+
+    r36sGraphShow(0, def->NameList.at(map_number), def->FileName, xName, yName, zName, x, y, xText, yText, z);
+}
+// ===== end map window title-bar menu =====
