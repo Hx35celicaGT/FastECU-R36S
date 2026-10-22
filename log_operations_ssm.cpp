@@ -3479,7 +3479,10 @@ private:
         for (int g : graph)
             G = qMax(G, g);
         const int L = sfm.horizontalAdvance("-00000") + 6, R = L, hh = sfm.height() + 4;
-        const int rows = d.rows(), a = pos - win / 2;
+        // Live: the newest row (pos) is on the right edge, so the window fills the whole graph.
+        // A saved log: pos is on the centre marker, so you can move the pointer through it.
+        const bool liveEdge = usingLive;
+        const int rows = d.rows(), a = liveEdge ? pos - win : pos - win / 2;
         const int gh = r.height() / G;
         for (int g = 1; g <= G; g++)
         {
@@ -3594,11 +3597,15 @@ private:
                 p.setClipping(false);
             }
         }
-        // centre marker: the values in the list and the headers are read here
-        int mx = r.x() + L + (r.width() - L - R) / 2;
-        QPen dash(palette().text().color(), 1, Qt::DashLine);
-        p.setPen(dash);
-        p.drawLine(mx, r.top(), mx, r.bottom());
+        // centre marker (saved logs only): the values in the list and the headers are read here.
+        // Live has no marker; the values shown are the newest row, at the right edge.
+        if (!liveEdge)
+        {
+            int mx = r.x() + L + (r.width() - L - R) / 2;
+            QPen dash(palette().text().color(), 1, Qt::DashLine);
+            p.setPen(dash);
+            p.drawLine(mx, r.top(), mx, r.bottom());
+        }
     }
 
     void drawOption(QPainter &p, const QRect &b, const QString &text, bool on, int id)
