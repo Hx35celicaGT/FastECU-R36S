@@ -22,6 +22,7 @@ as GPLv3 section 5(a) requires. Changed code is marked with `// R36S:` comments.
 | Path | Purpose |
 |---|---|
 | `r36s/` | Launcher, packaging script, tester README and build notes for the R36S. |
+| `r36s/gamepad_mouse/` | Turns the R36S buttons and sticks into a mouse and keyboard for FastECU. |
 | `CHANGES-R36S.md` | This file. |
 | `.github/ISSUE_TEMPLATE/` | Test report form. |
 

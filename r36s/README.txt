@@ -16,8 +16,9 @@ WHAT YOU NEED
 - R36S running Arch R (any board: original or clone)
 - A PC with an SD card reader (Windows, Mac or Linux)
 - USB-C OTG adapter
-- An OBD cable that works with FastECU-R36S. Check "Tested cables" on the
-  GitHub page first: not every cable chip has a driver on Arch R.
+- OBD cable: Tactrix OpenPort 2.0 (tested with a clone).
+  VAG-COM / KKL cables usually have an FTDI chip, which Arch R has no
+  driver for yet. See "Cables" on the GitHub page for the latest list.
 
 
 1. PUT ARCH R ON THE CARD (skip if you already run Arch R)

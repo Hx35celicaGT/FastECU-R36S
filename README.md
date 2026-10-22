@@ -17,7 +17,17 @@ No internet is needed on the R36S. Everything FastECU needs is inside the zip, a
 
 | Board | Arch R image | Cable | Car | Result |
 |---|---|---|---|---|
-| R36S-V21 | Original | | | Logging works |
+| R36S-V21 | Original | Tactrix OpenPort 2.0 (clone) | | Logging works |
+
+### Cables
+
+| Cable | On the R36S | Notes |
+|---|---|---|
+| Tactrix OpenPort 2.0 (clone) | ✅ Tested | |
+| Tactrix OpenPort 2.0 (genuine) | Untested | Works with FastECU on PC; should work the same as the clone |
+| VAG-COM / KKL cable | Untested | Works with FastECU on PC, but these usually use an FTDI chip, and Arch R currently has no FTDI driver |
+
+The Arduino Nano (extra log device) works over a normal USB cable.
 
 Tested something? [Send a test report](../../issues/new?template=test-report.yml).
 

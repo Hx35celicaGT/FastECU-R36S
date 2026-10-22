@@ -54,9 +54,12 @@ mkdir -p "$PKG/app/lib" "$PKG/app/plugins" "$PKG/FastECU-Files" "$PKG/THIRD_PART
 cp "$CHROOT$APP/FastECU" "$PKG/app/FastECU"
 ELF_FILES=("$APP/FastECU")      # paths inside the chroot, for ldd
 
-# Gamepad -> mouse/keyboard helper (the buttons don't work without it)
-GAMEPAD="${GAMEPAD:-/root/r36s-input/gamepad_mouse}"
-[ -x "$CHROOT$GAMEPAD" ] || die "no gamepad_mouse at $CHROOT$GAMEPAD (set GAMEPAD=path inside the chroot)"
+# Gamepad -> mouse/keyboard helper (the buttons don't work without it).
+# Built here from r36s/gamepad_mouse, so it always matches the source in the zip.
+GAMEPAD=/tmp/fastecu-gamepad_mouse
+sudo cp "$REPO/r36s/gamepad_mouse/gamepad_mouse.cpp" "$CHROOT/tmp/fastecu-gamepad_mouse.cpp"
+in_chroot g++ -O2 -std=c++17 -o "$GAMEPAD" /tmp/fastecu-gamepad_mouse.cpp \
+    || die "gamepad_mouse did not compile in the chroot"
 cp "$CHROOT$GAMEPAD" "$PKG/app/gamepad_mouse"
 ELF_FILES+=("$GAMEPAD")
 
@@ -156,6 +159,7 @@ fi
 
 echo "$VERSION" > "$PKG/VERSION.txt"
 rm -f "$OUT/.owned-files" "$OUT/.packages"
+sudo rm -f "$CHROOT$GAMEPAD" "$CHROOT/tmp/fastecu-gamepad_mouse.cpp"
 
 # ---------- zip ----------
 (cd "$OUT" && zip -qr9 "$DIST/$NAME.zip" FastECU.sh FastECU-R36S)

@@ -78,5 +78,8 @@ r36s/make-release.sh v0.1
 4. On GitHub: **Releases → Draft a new release**, pick tag `v0.1`, and upload
    `dist/FastECU-R36S-v0.1.zip` and its `.sha256` file.
 
+`make-release.sh` also compiles `r36s/gamepad_mouse/gamepad_mouse.cpp` (the
+button helper) in the chroot, so its source always matches too.
+
 The zip contains the program, its libraries, all license texts and the source
 for exactly that commit, so it is GPL-complete on its own.

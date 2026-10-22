@@ -4,6 +4,9 @@
 #
 # Everything FastECU needs is inside FastECU-R36S/app (its own copy of Qt and
 # the other libraries), so nothing has to be installed and no internet is needed.
+#
+# It stops the Arch R menu to free the screen, runs FastECU with the gamepad
+# working as mouse + keyboard, then brings the menu back.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PKG="$HERE/FastECU-R36S"
@@ -25,7 +28,7 @@ fi
 # The card's ROMS partition may not allow running programs from it.
 # If it doesn't, copy the program once to internal storage and run it from there.
 LOADER="$APPDIR/lib/ld-linux-aarch64.so.1"
-chmod +x "$LOADER" "$APPDIR/FastECU" 2>/dev/null
+chmod +x "$LOADER" "$APPDIR/FastECU" "$APPDIR/gamepad_mouse" 2>/dev/null
 if ! "$LOADER" --version >/dev/null 2>&1; then
     VERSION="$(cat "$PKG/VERSION.txt" 2>/dev/null || echo unknown)"
     RUNDIR="${HOME:-/root}/.local/share/FastECU-R36S/$VERSION"
@@ -38,16 +41,23 @@ if ! "$LOADER" --version >/dev/null 2>&1; then
     LOADER="$APPDIR/lib/ld-linux-aarch64.so.1"
 fi
 
+# ---------- free the screen, and give it back when done ----------
+# Arch R draws its menu with sway. FastECU draws straight to the screen, so
+# sway has to stop first. The trap brings the menu back however FastECU ends.
+systemctl stop sway.service
+trap 'echo "Restoring menu $(date)"; sync; systemctl start essway.service' EXIT
+sleep 1
+
+# ---------- settings ----------
 # Settings, ECU definitions and datalogs stay on the card, next to the program,
 # so testers can reach them from a PC.
 export HOME="$PKG/userdata"
 export FASTECU_FILES="$PKG/FastECU-Files"
 mkdir -p "$HOME" "$FASTECU_FILES"
 
-# Use only the bundled Qt, not anything installed on the system
+# Use only the bundled Qt and libraries, not anything installed on the system
 export QT_PLUGIN_PATH="$APPDIR/plugins"
 unset QT_QPA_PLATFORM_PLUGIN_PATH LD_LIBRARY_PATH LD_PRELOAD
-
 
 # Display: draw straight to the screen (no graphics drivers needed)
 export QT_QPA_PLATFORM=linuxfb
@@ -58,18 +68,29 @@ run() {   # run a bundled program with the bundled libraries only
     "$LOADER" --library-path "$APPDIR/lib" --argv0 "$(basename "$1")" "$@"
 }
 
+# ---------- find the gamepad ----------
+# The built-in gamepad is the input device with a joystick handler (jsN).
+# Its event number can differ between boards, so look it up instead of
+# assuming event3.
+GAMEPAD_DEV=$(awk '
+    /^H: Handlers=/ && /js[0-9]/ {
+        sub(/^H: Handlers=/, "")
+        for (i = 1; i <= NF; i++) if ($i ~ /^event[0-9]+$/) { print "/dev/input/" $i; exit }
+    }' /proc/bus/input/devices 2>/dev/null)
+GAMEPAD_DEV="${GAMEPAD_DEV:-/dev/input/event3}"
+echo "Gamepad: $GAMEPAD_DEV"
+
+# gamepad_mouse needs the uinput driver to make the virtual mouse/keyboard
+[ -e /dev/uinput ] || modprobe uinput
+
 echo "Running from: $APPDIR"
 echo "----"
 
-# Buttons: gamepad -> mouse/keyboard (hands off the sticks for the first second)
-GP=""
-if [ -f "$APPDIR/gamepad_mouse" ]; then
-    run "$APPDIR/gamepad_mouse" --speed 550 &
-    GP=$!
-    sleep 1
-else
-    echo "gamepad_mouse not in package: buttons will not work"
-fi
+# ---------- run ----------
+# Gamepad -> mouse/keyboard (hands off the sticks for the first second)
+run "$APPDIR/gamepad_mouse" --device "$GAMEPAD_DEV" --speed 550 &
+GP=$!
+sleep 1
 
 cd "$APPDIR" || exit 1
 run "$APPDIR/FastECU" &
@@ -78,11 +99,7 @@ FE=$!
 # Stop when either one ends:
 #  - FastECU closed normally (File -> Quit), or
 #  - SELECT + START held (quits gamepad_mouse) = emergency exit
-if [ -n "$GP" ]; then
-    wait -n $GP $FE
-else
-    wait $FE
-fi
+wait -n $GP $FE
 CODE=$?
 
 kill $GP $FE 2>/dev/null
@@ -92,5 +109,4 @@ wait 2>/dev/null
 
 echo "----"
 echo "Stopped with code $CODE at $(date)"
-sync
 exit $CODE
