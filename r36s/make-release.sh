@@ -82,11 +82,11 @@ declare -A LIBS=()
 for f in "${ELF_FILES[@]}"; do
     while read -r soname path; do
         LIBS["$soname"]="$path"
-    done < <(in_chroot ldd "$f" 2>/dev/null | awk '$2 == "=>" && $3 ~ /^\// {print $1, $3}')
+    done < <(in_chroot ldd "$f" 2>/dev/null | awk '$2 == "=>" && $3 ~ /^\// && $1 !~ /^\// {print $1, $3}')
 done
 
 LOADER_NAME="${LOADER_NAME:-ld-linux-aarch64}"   # only changed for testing on a PC
-LOADER=$(in_chroot ldd "$APP/FastECU" | awk -v n="$LOADER_NAME" 'index($1, n) {print $1}')
+LOADER=$(in_chroot ldd "$APP/FastECU" | awk -v n="$LOADER_NAME" 'index($1, n) {print ($2 == "=>" && $3 ~ /^\//) ? $3 : $1}')
 [ -n "$LOADER" ] || die "could not find the program loader ($LOADER_NAME) in ldd output"
 
 for soname in "${!LIBS[@]}"; do
