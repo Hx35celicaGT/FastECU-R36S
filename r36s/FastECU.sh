@@ -64,6 +64,19 @@ sleep 1
 export HOME="$PKG/userdata"
 export FASTECU_FILES="$PKG/FastECU-Files"
 mkdir -p "$HOME/.config" "$FASTECU_FILES"   # FastECU only creates one folder level itself
+mkdir -p "$FASTECU_FILES/datalogs" "$FASTECU_FILES/roms" \
+         "$FASTECU_FILES/definitions/ECUFlash" "$FASTECU_FILES/definitions/Romraider"
+
+# First start: point FastECU's ROM, definition and datalog folders at
+# FastECU-Files (FastECU's own defaults are relative paths inside app/).
+# Only done when there is no settings file yet, so user changes are kept.
+FASTECU_VERSION="$(cat "$APPDIR/fastecu-version.txt" 2>/dev/null)"
+CFG_DIR="$HOME/.config/FastECU/$FASTECU_VERSION/config"
+if [ -n "$FASTECU_VERSION" ] && [ -f "$APPDIR/fastecu.cfg.template" ] && [ ! -f "$CFG_DIR/fastecu.cfg" ]; then
+    mkdir -p "$CFG_DIR"
+    sed "s#@FILES@#$FASTECU_FILES#g" "$APPDIR/fastecu.cfg.template" > "$CFG_DIR/fastecu.cfg"
+    echo "First start: settings point at $FASTECU_FILES"
+fi
 
 # Use only the bundled Qt and libraries, not anything installed on the system
 export QT_PLUGIN_PATH="$APPDIR/plugins"

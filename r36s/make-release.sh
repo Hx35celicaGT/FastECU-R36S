@@ -145,6 +145,12 @@ cp "$REPO/LICENSE" "$PKG/LICENSE.txt"
 cp "$REPO/CHANGES-R36S.md" "$PKG/CHANGES-R36S.md"
 cp "$REPO/r36s/README.txt" "$PKG/README.txt"
 cp "$REPO/r36s/FastECU.sh" "$OUT/FastECU.sh"
+cp "$REPO/r36s/FastECU PC Transfer On.sh" "$REPO/r36s/FastECU PC Transfer Off.sh" "$OUT/"
+cp "$REPO/r36s/fastecu.cfg.template" "$PKG/app/fastecu.cfg.template"
+# FastECU keeps its settings in a folder named after its version
+FASTECU_VERSION=$(sed -n 's/.*software_version = "\([^"]*\)".*/\1/p' "$REPO/file_actions.h" | head -1)
+[ -n "$FASTECU_VERSION" ] || die "could not read software_version from file_actions.h"
+echo "$FASTECU_VERSION" > "$PKG/app/fastecu-version.txt"
 if [ -d "$REPO/r36s/FastECU-Files" ]; then
     cp -r "$REPO/r36s/FastECU-Files/." "$PKG/FastECU-Files/"
 fi
@@ -162,7 +168,7 @@ rm -f "$OUT/.owned-files" "$OUT/.packages"
 sudo rm -f "$CHROOT$GAMEPAD" "$CHROOT/tmp/fastecu-gamepad_mouse.cpp"
 
 # ---------- zip ----------
-(cd "$OUT" && zip -qr9 "$DIST/$NAME.zip" FastECU.sh FastECU-R36S)
+(cd "$OUT" && zip -qr9 "$DIST/$NAME.zip" FastECU.sh "FastECU PC Transfer On.sh" "FastECU PC Transfer Off.sh" FastECU-R36S)
 (cd "$DIST" && sha256sum "$NAME.zip" > "$NAME.zip.sha256")
 
 echo

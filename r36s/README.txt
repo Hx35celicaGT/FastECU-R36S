@@ -28,43 +28,78 @@ a) BACK UP THE CARD THAT CAME WITH THE R36S FIRST.
    It holds the file needed to fix the screen if it looks wrong later.
 b) Find out if your R36S is an original or a clone, and the board version
    printed on the circuit board (for example "R36S-V21").
-c) Download the Arch R Flasher for your PC:
+c) Download and open the Arch R Flasher for your PC:
      https://github.com/archr-linux/archr-flasher/releases
-d) In the flasher, pick the image (Original or Clone) and your screen panel,
-   then flash a good-quality SD card.
-e) Put the card in the R36S and turn it on. Let it finish its first start
-   until you see the menu. Then turn it off.
+d) Go through its 5 steps: Console (Original / Clone / Soysauce) ->
+   Image (Download latest version) -> Overlay (your screen panel file) ->
+   SD Card -> Flash. Leave "Verify after writing" ticked.
+e) Put the card in the R36S and turn it on. The first start shows setup
+   messages for 1-2 minutes while the card is prepared. Wait for the menu.
 If the screen shows wrong colors or a rolling band, see "SCREEN PROBLEMS" below.
 
 
-2. COPY FASTECU-R36S TO THE CARD
---------------------------------
-a) Put the card in your PC.
+2. COPY FASTECU-R36S ONTO THE R36S
+----------------------------------
+Arch R keeps games and ports on a Linux (ext4) partition called STORAGE.
+Windows and Mac can't open it directly, so pick the way that fits you.
+In every case, copy these from the zip into the "ports" folder:
+     FastECU.sh
+     FastECU PC Transfer On.sh
+     FastECU PC Transfer Off.sh
+     FastECU-R36S   (folder)
+
+A) Over Wi-Fi (Windows, Mac, Linux) - needs a USB Wi-Fi adapter on the R36S
+   On the R36S: Network Settings -> Network Services -> Enable Samba.
+   On the PC, open the share:
+     Windows:  \\archr\games-roms   (in File Explorer's address bar)
+     Mac:      Finder -> Go -> Connect to Server -> smb://archr.local/games-roms
+     Linux:    smb://archr.local/games-roms
+   Open "ports" and copy the files in.
+
+B) Card in a Linux PC
+   Turn the R36S off, put the card in the PC, open the STORAGE partition,
+   then roms -> ports, and copy the files in (as root if it asks).
+   Eject the card properly before taking it out.
+
+C) Card in a Windows or Mac PC, no Wi-Fi
+   Install an ext4 driver first (for example Paragon "Linux File Systems"),
+   then do the same as B.
    WINDOWS: if it asks "You need to format the disk", click CANCEL.
    Formatting erases the card.
-b) Open the ROMS partition, then the ports folder.
-c) Copy BOTH of these from the zip into the ports folder:
-     FastECU.sh
-     FastECU-R36S   (folder)
-d) Eject the card safely, put it back in the R36S.
+
+After copying: in the R36S menu, Start -> Game Settings -> Update gamelists,
+or restart the R36S.
 
 
 3. START IT
 -----------
-Turn on the R36S, go to Ports, start FastECU.
+Go to Ports, start FastECU. The menu closes and FastECU opens full screen.
 Plug the OBD cable into the R36S with the OTG adapter, then into the car.
 Turn the ignition on.
 
 The sticks move the mouse pointer. To quit: File -> Quit.
 If FastECU stops responding, hold SELECT + START to force it closed.
+Either way the Arch R menu comes back.
+
+
+4. GETTING FILES ON AND OFF (logs, ROMs, definitions)
+-----------------------------------------------------
+Everything is in ports/FastECU-R36S/FastECU-Files (see README.txt there).
+With a PC cable:
+  a) Ports -> "FastECU PC Transfer On".
+  b) Connect the R36S to the PC with a USB-C DATA cable (charge-only cables
+     don't work). The PC shows "ArchR Device".
+  c) Open Roms -> ports -> FastECU-R36S -> FastECU-Files.
+  d) When done, unplug and run Ports -> "FastECU PC Transfer Off" so the
+     port works with the OBD cable again.
+Or use Wi-Fi (Samba) as in step 2A.
 
 
 WHERE YOUR FILES ARE
 --------------------
-All on the card, inside ports/FastECU-R36S:
-  FastECU-Files/       log_setup.txt (what is shown and logged)
-  userdata/            settings, and datalogs (CSV files) in
-                       userdata/.config/FastECU/<version>/datalogs
+All inside ports/FastECU-R36S:
+  FastECU-Files/       datalogs, ROMs, definitions, log_setup.txt
+  userdata/            FastECU's own settings
   fastecu-debug.log    what happened on the last run, including which USB
                        cables the R36S saw (attach to bug reports)
 

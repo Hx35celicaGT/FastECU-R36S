@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config name="FastECU" version="0.0-dev0">
+    <software_settings>
+        <setting name="window_size">
+            <value width="maximized"/>
+            <value height="maximized"/>
+        </setting>
+        <setting name="toolbar_iconsize">
+            <value data="32"/>
+        </setting>
+        <setting name="serial_port">
+            <value data="ttyACM0 - OpenPort 2.0"/>
+        </setting>
+        <setting name="protocol_id">
+            <value data="35"/>
+        </setting>
+        <setting name="flash_transport">
+            <value data="iso15765"/>
+        </setting>
+        <setting name="log_transport">
+            <value data="K-Line"/>
+        </setting>
+        <setting name="log_protocol">
+            <value data="SSM"/>
+        </setting>
+        <setting name="primary_definition_base">
+            <value data="romraider"/>
+        </setting>
+        <setting name="calibration_files"/>
+        <setting name="calibration_files_directory">
+            <value data="@FILES@/roms/"/>
+        </setting>
+        <setting name="use_romraider_definitions">
+            <value data="disabled"/>
+        </setting>
+        <setting name="romraider_definition_files">
+            <value data=""/>
+        </setting>
+        <setting name="use_ecuflash_definitions">
+            <value data="disabled"/>
+        </setting>
+        <setting name="ecuflash_definition_files_directory">
+            <value data="@FILES@/definitions/ECUFlash/"/>
+        </setting>
+        <setting name="logger_definition_file">
+            <value data=""/>
+        </setting>
+        <setting name="datalog_files_directory">
+            <value data="@FILES@/datalogs/"/>
+        </setting>
+    </software_settings>
+</config>
