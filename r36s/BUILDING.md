@@ -53,7 +53,7 @@ exit
 ### 4. Source in the chroot
 
 ```
-sudo git clone https://github.com/<your-user>/FastECU-R36S.git ~/r36s-chroot/root/FastECU
+sudo git clone https://github.com/Hx35celicaGT/FastECU-R36S.git ~/r36s-chroot/root/FastECU
 sudo chroot ~/r36s-chroot /bin/bash -c "cd /root/FastECU && git checkout r36s && qmake FastECU.pro"
 ```
 
