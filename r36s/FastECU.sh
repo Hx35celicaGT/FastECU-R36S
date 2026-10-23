@@ -63,7 +63,7 @@ sleep 1
 # so testers can reach them from a PC.
 export HOME="$PKG/userdata"
 export FASTECU_FILES="$PKG/FastECU-Files"
-mkdir -p "$HOME" "$FASTECU_FILES"
+mkdir -p "$HOME/.config" "$FASTECU_FILES"   # FastECU only creates one folder level itself
 
 # Use only the bundled Qt and libraries, not anything installed on the system
 export QT_PLUGIN_PATH="$APPDIR/plugins"
