@@ -15,9 +15,9 @@ communities, copy them in, then select them in FastECU: Settings ->
 Definitions.
 
 Getting files on and off the R36S:
-  - PC cable: run "FastECU PC Transfer On" from Ports, connect a USB-C DATA
-    cable (charge-only cables won't work). The PC shows "ArchR Device" ->
-    Roms -> ports -> FastECU-R36S -> FastECU-Files. Run "FastECU PC
-    Transfer Off" when done.
+  - PC cable: select "FastECU-Data-Transfer-OFF" in Ports to turn transfer
+    on, connect a USB-C DATA cable (charge-only cables won't work). The PC
+    shows "ArchR Device" -> Roms -> ports -> FastECU-R36S -> FastECU-Files.
+    Select "FastECU-Data-Transfer-ON" to turn it off when done.
   - Wi-Fi: turn on Samba in Arch R, open \\archr\games-roms on the PC.
   - Card in a Linux PC: STORAGE partition -> roms/ports/FastECU-R36S.

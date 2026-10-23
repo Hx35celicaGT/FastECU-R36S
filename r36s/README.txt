@@ -44,8 +44,7 @@ Arch R keeps games and ports on a Linux (ext4) partition called STORAGE.
 Windows and Mac can't open it directly, so pick the way that fits you.
 In every case, copy these from the zip into the "ports" folder:
      FastECU.sh
-     FastECU PC Transfer On.sh
-     FastECU PC Transfer Off.sh
+     FastECU-Data-Transfer-OFF.sh
      FastECU-R36S   (folder)
 
 A) Over Wi-Fi (Windows, Mac, Linux) - needs a USB Wi-Fi adapter on the R36S
@@ -86,12 +85,13 @@ Either way the Arch R menu comes back.
 -----------------------------------------------------
 Everything is in ports/FastECU-R36S/FastECU-Files (see README.txt there).
 With a PC cable:
-  a) Ports -> "FastECU PC Transfer On".
+  a) Ports -> "FastECU-Data-Transfer-OFF" (select it to turn transfer ON).
+     The menu refreshes and the entry now reads "FastECU-Data-Transfer-ON".
   b) Connect the R36S to the PC with a USB-C DATA cable (charge-only cables
      don't work). The PC shows "ArchR Device".
   c) Open Roms -> ports -> FastECU-R36S -> FastECU-Files.
-  d) When done, unplug and run Ports -> "FastECU PC Transfer Off" so the
-     port works with the OBD cable again.
+  d) When done, unplug and select "FastECU-Data-Transfer-ON" to turn it OFF,
+     so the port works with the OBD cable again.
 Or use Wi-Fi (Samba) as in step 2A.
 
 

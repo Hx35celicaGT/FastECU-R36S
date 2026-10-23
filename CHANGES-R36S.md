@@ -23,7 +23,7 @@ as GPLv3 section 5(a) requires. Changed code is marked with `// R36S:` comments.
 |---|---|
 | `r36s/` | Launcher, packaging script, tester README and build notes for the R36S. |
 | `r36s/FastECU-Files/`, `r36s/fastecu.cfg.template` | Folder layout for ROMs, definitions and datalogs, and first-start settings pointing FastECU at it. |
-| `r36s/FastECU PC Transfer On.sh` / `Off.sh` | Turn Arch R's USB file transfer (MTP) on and off from the Ports menu. |
+| `r36s/FastECU-Data-Transfer-OFF.sh` | One-button toggle for Arch R's USB file transfer (MTP); renames itself to show ON/OFF. |
 | `r36s/gamepad_mouse/` | Turns the R36S buttons and sticks into a mouse and keyboard for FastECU. |
 | `CHANGES-R36S.md` | This file. |
 | `.github/ISSUE_TEMPLATE/` | Test report form. |
