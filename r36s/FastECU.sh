@@ -13,6 +13,16 @@ PKG="$HERE/FastECU-R36S"
 APPDIR="$PKG/app"
 LOG="$PKG/fastecu-debug.log"
 
+# The menu (sway + EmulationStation) starts this script. Stopping sway would
+# also stop anything the menu started, so hand off to a separate background
+# service first (the same way the original FastECU menu entry does), and let
+# the menu's copy end right away.
+if [ -z "${FASTECU_DETACHED:-}" ]; then
+    systemd-run --unit=fastecu-r36s --collect --setenv=FASTECU_DETACHED=1 \
+        /bin/bash "$HERE/$(basename "$0")" > "$PKG/fastecu-start.log" 2>&1
+    exit 0
+fi
+
 # Keep the last two runs' output for bug reports
 [ -f "$LOG" ] && mv -f "$LOG" "$LOG.old"
 exec >"$LOG" 2>&1
