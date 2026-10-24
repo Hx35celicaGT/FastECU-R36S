@@ -1,6 +1,3 @@
-// FastECU-R36S: gamepad -> mouse/keyboard helper.
-// Copyright (C) 2026 Victor. Licensed under the GNU GPL version 3 (see LICENSE).
-//
 // gamepad_mouse.cpp
 // R36S "GO-Super Gamepad" -> virtual mouse + virtual keyboard (via /dev/uinput)
 // so FastECU (Qt, linuxfb) can be driven with the handheld's controls.
@@ -41,28 +38,59 @@ volatile std::sig_atomic_t g_running = 1;
 void onSignal(int) { g_running = 0; }
 
 enum class Action { MouseLeft, MouseRight, MouseMiddle, Key, ShiftTab };
-struct Mapping { Action action; int key; };
+
+// key   = the key to send
+// ctrl  = hold Ctrl while sending it (Ctrl+L, Ctrl+H ...)
+// tap   = send press+release at once when the button goes down, so holding the
+//         button can never repeat it (used for on/off actions like Logging)
+struct Mapping { Action action; int key; bool ctrl = false; bool tap = false; };
+
+// FN (BTN_MODE) works like a second layer: while FN is held, buttons use kFnMap.
+// FN on its own sends nothing.
+bool g_fnHeld = false;
 
 // ====================== BUTTON MAPPING (edit here, then rebuild) ======================
+// Buttons on their own
 const std::map<int, Mapping> kButtonMap = {
-    { BTN_EAST,      { Action::MouseLeft,   0 } },            // left click
-    { BTN_SOUTH,       { Action::Key,         KEY_ESC } },      // cancel / close dialog
-    { BTN_NORTH,      { Action::MouseRight,  0 } },            // right click
-    { BTN_WEST,       { Action::Key,         KEY_ENTER } },    // OK / confirm
-    { BTN_TL,         { Action::ShiftTab,    0 } },            // L1: previous field
-    { BTN_TR,         { Action::Key,         KEY_TAB } },      // R1: next field
-    { BTN_TL2,        { Action::Key,         KEY_PAGEUP } },   // L2
-    { BTN_TR2,        { Action::Key,         KEY_PAGEDOWN } }, // R2
-    { BTN_SELECT,     { Action::Key,         KEY_SPACE } },    // toggle checkbox/button
-    { BTN_START,      { Action::Key,         KEY_ENTER } },
-    { BTN_THUMBL,     { Action::MouseLeft,   0 } },            // L3 click
-    { BTN_THUMBR,     { Action::MouseMiddle, 0 } },            // R3 click
+    { BTN_EAST,       { Action::MouseLeft,   0 } },                       // A: left click
+    { BTN_SOUTH,      { Action::Key,         KEY_ESC } },                 // B: cancel / close dialog
+    { BTN_NORTH,      { Action::MouseRight,  0 } },                       // X: right click
+    { BTN_WEST,       { Action::Key,         KEY_ENTER } },               // Y: OK / confirm
+    { BTN_TL,         { Action::ShiftTab,    0 } },                       // L1: previous field / view
+    { BTN_TR,         { Action::Key,         KEY_TAB } },                 // R1: next field / view
+    { BTN_TL2,        { Action::Key,         KEY_KPMINUS, true } },       // L2: Ctrl+-  fine step down
+    { BTN_TR2,        { Action::Key,         KEY_KPPLUS,  true } },       // R2: Ctrl++  fine step up
+    { BTN_SELECT,     { Action::Key,         KEY_SPACE } },               // toggle checkbox/button
+    { BTN_START,      { Action::Key,         KEY_SPACE, false, true } },  // Space: Logging = 6 boxes on/off
+    { BTN_THUMBL,     { Action::MouseLeft,   0 } },                       // L3 click
+    { BTN_THUMBR,     { Action::MouseMiddle, 0 } },                       // R3 click
     { BTN_DPAD_UP,    { Action::Key,         KEY_UP } },
     { BTN_DPAD_DOWN,  { Action::Key,         KEY_DOWN } },
     { BTN_DPAD_LEFT,  { Action::Key,         KEY_LEFT } },
     { BTN_DPAD_RIGHT, { Action::Key,         KEY_RIGHT } },
 };
+
+// Buttons while FN is held (buttons not listed here do nothing while FN is held)
+const std::map<int, Mapping> kFnMap = {
+    { BTN_START,      { Action::Key, KEY_L,       true,  true } },   // Ctrl+L: Log to file (CSV) on/off
+    { BTN_TR2,        { Action::Key, KEY_KPPLUS } },                 // +  coarse step up
+    { BTN_TL2,        { Action::Key, KEY_KPMINUS } },                // -  coarse step down
+    { BTN_EAST,       { Action::Key, KEY_S,       false, true } },   // A: S      Set value
+    { BTN_SOUTH,      { Action::Key, KEY_I,       true,  true } },   // B: Ctrl+I interpolate both ways
+    { BTN_NORTH,      { Action::Key, KEY_H,       true,  true } },   // X: Ctrl+H interpolate horizontal
+    { BTN_WEST,       { Action::Key, KEY_J,       true,  true } },   // Y: Ctrl+J interpolate vertical
+    { BTN_TR,         { Action::Key, KEY_F3,      false, true } },   // R1: F3 Connect
+    { BTN_TL,         { Action::Key, KEY_F4,      false, true } },   // L1: F4 Disconnect
+    { BTN_DPAD_UP,    { Action::Key, KEY_F6,      false, true } },   // D-pad up:    F6 Send to 2D/3D graph
+    { BTN_DPAD_LEFT,  { Action::Key, KEY_F7,      false, true } },   // D-pad left:  F7 Send X axis to 2D graph
+    { BTN_DPAD_RIGHT, { Action::Key, KEY_F8,      false, true } },   // D-pad right: F8 Send Y axis to 2D graph
+    { BTN_DPAD_DOWN,  { Action::Key, KEY_F9,      false, true } },   // D-pad down:  F9 Copy Table
+};
 // =======================================================================================
+
+// What each held button actually sent, so letting go of FN first can't leave a key stuck
+std::map<int, Mapping> g_sent;
+
 
 struct Settings {
     std::string device = "/dev/input/event3";
@@ -189,15 +217,20 @@ const char* btnName(int c) {
     }
 }
 
-void handleButton(int code, int value, int mfd, int kfd) {
-    auto it = kButtonMap.find(code);
-    if (it == kButtonMap.end()) return;
-    const Mapping& m = it->second;
+void sendMapping(const Mapping& m, int value, int mfd, int kfd) {
     switch (m.action) {
         case Action::MouseLeft:   emitEv(mfd, EV_KEY, BTN_LEFT, value);   syn(mfd); break;
         case Action::MouseRight:  emitEv(mfd, EV_KEY, BTN_RIGHT, value);  syn(mfd); break;
         case Action::MouseMiddle: emitEv(mfd, EV_KEY, BTN_MIDDLE, value); syn(mfd); break;
-        case Action::Key:         emitEv(kfd, EV_KEY, m.key, value);      syn(kfd); break;
+        case Action::Key:
+            if (value) {
+                if (m.ctrl) { emitEv(kfd, EV_KEY, KEY_LEFTCTRL, 1); syn(kfd); }
+                emitEv(kfd, EV_KEY, m.key, 1); syn(kfd);
+            } else {
+                emitEv(kfd, EV_KEY, m.key, 0); syn(kfd);
+                if (m.ctrl) { emitEv(kfd, EV_KEY, KEY_LEFTCTRL, 0); syn(kfd); }
+            }
+            break;
         case Action::ShiftTab:
             if (value) {
                 emitEv(kfd, EV_KEY, KEY_LEFTSHIFT, 1); syn(kfd);
@@ -209,6 +242,28 @@ void handleButton(int code, int value, int mfd, int kfd) {
             break;
     }
 }
+
+void handleButton(int code, int value, int mfd, int kfd) {
+    if (value) {
+        // Button down: pick the FN layer or the normal layer
+        const std::map<int, Mapping>& layer = g_fnHeld ? kFnMap : kButtonMap;
+        auto it = layer.find(code);
+        if (it == layer.end()) return;
+        const Mapping& m = it->second;
+        sendMapping(m, 1, mfd, kfd);
+        if (m.tap)
+            sendMapping(m, 0, mfd, kfd);   // release right away: no auto-repeat
+        else
+            g_sent[code] = m;              // remember it so the release matches
+    } else {
+        // Button up: release exactly what was pressed (even if FN changed meanwhile)
+        auto it = g_sent.find(code);
+        if (it == g_sent.end()) return;
+        sendMapping(it->second, 0, mfd, kfd);
+        g_sent.erase(it);
+    }
+}
+
 
 void usage() {
     std::puts("Usage: gamepad_mouse [--device PATH] [--speed N] [--deadzone F] [--swap-sticks]\n"
@@ -301,6 +356,7 @@ int main(int argc, char** argv) {
                         g_running = 0;
                         break;
                     }
+                    if (ev.code == BTN_MODE) { g_fnHeld = ev.value != 0; continue; }  // FN = second layer
                     handleButton(ev.code, ev.value, mfd, kfd);
                 } else if (ev.type == EV_ABS) {
                     switch (ev.code) {
