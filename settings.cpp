@@ -208,7 +208,8 @@ QVBoxLayout *Settings::create_ui_config_page(FileActions::ConfigValuesStructure 
     QGroupBox *toolbar_group = new QGroupBox(tr("Toolbar settings"));
     QLabel *toolbar_iconsize_label = new QLabel("Toolbar icon size:");
     toolbar_iconsize_spinbox = new QSpinBox();
-    toolbar_iconsize_spinbox->setRange(8, 64);      // R36S: add this line
+      toolbar_iconsize_spinbox->setRange(0, 64);
+      toolbar_iconsize_spinbox->setSpecialValueText("Auto");   // R36S: 0 = Auto (13 on the R36S, 32 on a PC)
     toolbar_iconsize_spinbox->setValue(configValues->toolbar_iconsize.toInt());
     connect(toolbar_iconsize_spinbox, SIGNAL(valueChanged(int)), this, SLOT(toolbar_iconsize_value_changed(int)));
 

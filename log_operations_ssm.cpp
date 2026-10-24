@@ -4779,3 +4779,126 @@ void r36sGraphShow(int mode, const QString &title, const QString &file,
 
 // ===== end R36S Set value window =====
 
+
+// ===== R36S: Help > Controls (PC / R36S) =====
+// One page listing every control: the PC key, the R36S button that sends it, and what it does.
+// Keep this up to date when gamepad_mouse.cpp or any R36S key handling changes.
+// Full screen on a small screen (R36S), a normal window on a PC. D-pad / arrows scroll, B / Esc closes.
+#include <QTextBrowser>
+#include <QScreen>
+
+static QString r36sControlsHtml()
+{
+    struct Row { const char *pc, *r36s, *action; };
+    struct Section { const char *title; QVector<Row> rows; };
+    const QVector<Section> sections = {
+        { "Everywhere", {
+            { "Move mouse",     "Left stick",          "Move the pointer. It hides after 3 s or when the D-pad / Y is used; move the stick to bring it back" },
+            { "Mouse wheel",    "Right stick",         "Scroll" },
+            { "Left click",     "A  (or L3)",          "Click. Ignored while the pointer is hidden (except in the calibration list)" },
+            { "Right click",    "X",                   "Right-click menu" },
+            { "Middle click",   "R3",                  "Middle click" },
+            { "Esc",            "B",                   "Cancel / close a dialog" },
+            { "Enter",          "Y",                   "OK / confirm" },
+            { "Space",          "Select",              "Tick a box / press the highlighted button" },
+            { "Tab / Shift+Tab","R1 / L1",             "Next / previous desktop: FastECU, CSV viewer, 2D / 3D graph. In a dialog: next / previous field" },
+            { "-",              "Select + Start (hold)","Quit FastECU" },
+            { "-",              "Power (tap)",         "Screen off / on" },
+        } },
+        { "Main page: logging and connection", {
+            { "Space",          "Start",               "Logging on / off (the 6 boxes)" },
+            { "Ctrl+L",         "FN + Start",          "Log to file (CSV) on / off" },
+            { "F3",             "FN + R1",             "Connect" },
+            { "F4",             "FN + L1",             "Disconnect" },
+        } },
+        { "Main page: calibration list (tap it first)", {
+            { "Click the list", "A on the list",       "The D-pad now moves in the list (tap a table to give it back)" },
+            { "Up / Down",      "D-pad up / down",     "Move" },
+            { "Right",          "D-pad right",         "Open a category and go to its first map" },
+            { "Left",           "D-pad left",          "Back to the category and close it" },
+            { "Enter",          "Y",                   "Open the map, or bring it to the front" },
+            { "Click its tick", "A",                   "Open / close the map (tick / untick)" },
+        } },
+        { "Main page: map tables (tap the table first)", {
+            { "Arrows",         "D-pad",               "Move between cells" },
+            { "Ctrl++ / Ctrl+-","R2 / L2",             "Fine step up / down" },
+            { "+ / -",          "FN + R2 / FN + L2",   "Coarse step up / down" },
+            { "S",              "FN + A",              "Set value  ( =  +  -  x  / )" },
+            { "Ctrl+H",         "FN + X",              "Interpolate horizontal" },
+            { "Ctrl+J",         "FN + Y",              "Interpolate vertical" },
+            { "Ctrl+I",         "FN + B",              "Interpolate both ways" },
+            { "Ctrl+C / Ctrl+V","-",                   "Copy / paste the selected cells" },
+            { "F6",             "FN + D-pad up",       "Send this map to the 2D / 3D graph" },
+            { "F7",             "FN + D-pad left",     "Send its X axis to the 2D graph" },
+            { "F8",             "FN + D-pad right",    "Send its Y axis to the 2D graph" },
+            { "F9",             "FN + D-pad down",     "Copy Table (whole table with its headers)" },
+            { "Click the map's top-left icon", "A on that icon", "Window menu: Copy / Paste Table, Send To graph" },
+        } },
+        { "Desktop 2: CSV viewer (logs)", {
+            { "Up / Down",      "D-pad up / down",     "Move through the value list" },
+            { "Left / Right",   "D-pad left / right",  "Move along the log (hold = faster)" },
+            { "Enter or click", "Y or A",              "Pick the graph, side and colour for the highlighted value" },
+            { "Space",          "Select",              "Older logs" },
+            { "+ / -",          "R2 / L2",             "Zoom in / out" },
+            { "Esc",            "B",                   "Close the picker / log list" },
+        } },
+        { "Desktop 3: 2D / 3D graph", {
+            { "Arrows",         "D-pad",               "Move the crosshair one cell" },
+            { "Esc",            "B",                   "Crosshair to the point under the pointer (pointer showing)" },
+            { "Drag",           "A + left stick",      "Turn the 3D view" },
+            { "+ / -",          "R2 / L2",             "Zoom in / out around the crosshair" },
+            { "Enter",          "Y",                   "Starting view, no zoom" },
+        } },
+        { "Set value window", {
+            { "Left / Right",   "D-pad left / right",  "Pick a spot (far left = operation)" },
+            { "Up / Down",      "D-pad up / down",     "Change it:  =  +  -  x  /  or a digit" },
+            { "Type 0-9 . = + - * /", "-",             "Type the value directly (PC)" },
+            { "Enter",          "Y",                   "Apply to every selected cell" },
+            { "Esc",            "B",                   "Cancel" },
+        } },
+    };
+
+    QString h = "<style>"
+                "table { border-collapse: collapse; }"
+                "td, th { padding: 2px 6px; border-bottom: 1px solid #c8c8c8; vertical-align: top; }"
+                "th { text-align: left; background: #3b78c8; color: white; }"
+                "td.k { font-weight: bold; }"
+                "h3 { margin: 10px 0 2px 0; }"
+                "</style>";
+    h += "<p>FN works like Ctrl on the R36S: hold it, then press the other button. "
+         "D-pad / arrows scroll this page, B / Esc closes it.</p>";
+    for (const Section &s : sections)
+    {
+        h += QString("<h3>%1</h3><table width='100%'><tr><th width='27%'>PC</th><th width='25%'>R36S</th><th width='48%'>Action</th></tr>")
+                 .arg(s.title);
+        for (const Row &r : s.rows)
+            h += QString("<tr><td class='k'>%1</td><td class='k'>%2</td><td>%3</td></tr>")
+                     .arg(QString(r.pc).toHtmlEscaped(), QString(r.r36s).toHtmlEscaped(), QString(r.action).toHtmlEscaped());
+        h += "</table>";
+    }
+    return h;
+}
+
+void r36sShowControls(QWidget *parent)
+{
+    QDialog dlg(parent);
+    dlg.setWindowTitle("Controls (PC / R36S)");
+    QVBoxLayout *layout = new QVBoxLayout(&dlg);
+    layout->setContentsMargins(4, 4, 4, 4);
+    QTextBrowser *text = new QTextBrowser(&dlg);
+    text->setHtml(r36sControlsHtml());
+    text->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);   // the tables wrap to the width
+    layout->addWidget(text);
+    QDialogButtonBox *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dlg);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    layout->addWidget(buttons);
+    QScreen *screen = QGuiApplication::primaryScreen();
+    QRect avail = screen ? screen->availableGeometry() : QRect(0, 0, 800, 600);
+    if (avail.width() <= 800 || avail.height() <= 600)
+        dlg.setGeometry(avail);                    // R36S: the whole screen
+    else
+        dlg.resize(760, qMin(700, avail.height() - 80));
+    text->setFocus();                              // D-pad / arrows scroll straight away
+    dlg.exec();
+}
+// ===== end R36S Help > Controls =====

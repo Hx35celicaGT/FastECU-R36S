@@ -9,6 +9,8 @@
 #include <QLabel>
 #include <QTimer>
 #include <QKeyEvent>
+#include <QShortcut>
+#include <QScreen>
 #include <QFontMetrics>
 #include <QGridLayout>
 #include <algorithm>
@@ -142,6 +144,7 @@ static void r36sSetupLogGrid(QWidget *area)
 void r36sPanelSetup(QWidget *area, FileActions::LogValuesStructure *lv, const QString &protocol);
 void r36sPanelUpdate(QWidget *area, FileActions::LogValuesStructure *lv);
 void r36sDesktopsInstall(QMainWindow *win);   // R36S: L1/R1 desktops (log_operations_ssm.cpp)
+void r36sShowControls(QWidget *parent);       // R36S: Help > Controls (log_operations_ssm.cpp)
 
 const QColor MainWindow::RED_LIGHT_OFF = QColor(96, 32, 32);
 const QColor MainWindow::YELLOW_LIGHT_OFF = QColor(96, 96, 32);
@@ -354,14 +357,59 @@ MainWindow::MainWindow(QString peerAddress, QString peerPassword, QWidget *paren
     //connect(ui->action_Preferences, SIGNAL(triggered()), this, SLOT(openPreferences()));
     connect(ui->calibrationFilesTreeWidget, SIGNAL(itemClicked(QTreeWidgetItem *,int)), this, SLOT(calibration_files_treewidget_item_selected(QTreeWidgetItem*)));
     connect(ui->calibrationDataTreeWidget, SIGNAL(itemClicked(QTreeWidgetItem *,int)), this, SLOT(calibration_data_treewidget_item_selected(QTreeWidgetItem*)));
-    connect(ui->calibrationDataTreeWidget, &QTreeWidget::itemClicked, this, [this]() {   // R36S: after a tap the D-pad stays in the list, on the same item
+    connect(ui->calibrationDataTreeWidget, &QTreeWidget::itemClicked, this, [this]() {
         QPersistentModelIndex keep(ui->calibrationDataTreeWidget->currentIndex());
         QTimer::singleShot(100, ui->calibrationDataTreeWidget, [this, keep]() {
             ui->calibrationDataTreeWidget->setFocus();
             if (keep.isValid())
                 ui->calibrationDataTreeWidget->setCurrentIndex(keep);
         });
+        
     });
+
+
+    // R36S: F6-F9 (FN + D-pad on the R36S) run the map window menu's items on the map in front,
+    // so they follow the same rules (2D / 3D maps only, X / Y only when that axis has values).
+    {
+        struct R36SMapKey { const char *key; const char *item; };
+        static const R36SMapKey r36sMapKeys[] = {
+            { "F6", "Send To 2D/3D Graph" },
+            { "F7", "Send X axis To 2D Graph" },
+            { "F8", "Send Y axis To 2D Graph" },
+            { "F9", "Copy Table" },
+        };
+        for (const R36SMapKey &k : r36sMapKeys)
+        {
+            QString item = k.item;
+            QShortcut *shortcut = new QShortcut(QKeySequence(k.key), this);
+            connect(shortcut, &QShortcut::activated, this, [this, item]() {
+                QMdiSubWindow *w = ui->mdiArea->currentSubWindow();   // the map tapped last
+                if (!w || !w->systemMenu())
+                    return;
+                for (QAction *a : w->systemMenu()->actions())
+                    if (a->text() == item && a->isEnabled())
+                    {
+                        a->trigger();
+                        return;
+                    }
+            });
+        }
+    }
+
+    // R36S: Help > Controls (PC / R36S)
+    {
+        QMenu *help = nullptr;
+        for (QMenu *m : ui->menubar->findChildren<QMenu*>())
+            if (m->title().remove('&') == "Help")
+                help = m;
+        if (!help)
+            help = ui->menubar->addMenu("Help");
+        QAction *controls = help->addAction("Controls (PC / R36S)");
+        connect(controls, &QAction::triggered, this, [this]() { r36sShowControls(this); });
+    }
+
+
+
     connect(ui->calibrationDataTreeWidget, SIGNAL(itemExpanded(QTreeWidgetItem*)), this, SLOT(calibration_data_treewidget_item_expanded(QTreeWidgetItem*)));
     connect(ui->calibrationDataTreeWidget, SIGNAL(itemCollapsed(QTreeWidgetItem*)), this, SLOT(calibration_data_treewidget_item_collapsed(QTreeWidgetItem*)));
     connect(calibrationTreeWidget, SIGNAL(closeRom()), this, SLOT(close_calibration()));
@@ -501,8 +549,15 @@ MainWindow::MainWindow(QString peerAddress, QString peerPassword, QWidget *paren
     connect(vbatt_timer, SIGNAL(timeout()), this, SLOT(update_vbatt()));
 
     setSplashScreenProgress("Setting up toolbar...", 10);
-    toolbar_item_size.setWidth(configValues->toolbar_iconsize.toInt());
-    toolbar_item_size.setHeight(configValues->toolbar_iconsize.toInt());
+      // R36S: icon size 0 = Auto: 13 on a small screen like the R36S, 32 on a PC
+      int r36sIconPx = configValues->toolbar_iconsize.toInt();
+      if (r36sIconPx <= 0)
+      {
+          QScreen *scr = QGuiApplication::primaryScreen();
+          r36sIconPx = (scr && scr->availableGeometry().height() <= 600) ? 13 : 32;
+      }
+      toolbar_item_size.setWidth(r36sIconPx);
+      toolbar_item_size.setHeight(r36sIconPx);
     ui->toolBar->setIconSize(toolbar_item_size);
 
     QWidget* spacer = new QWidget();
