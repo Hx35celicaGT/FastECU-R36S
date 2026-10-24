@@ -8,6 +8,7 @@
 #include <QGroupBox>
 #include <QLabel>
 #include <QTimer>
+#include <QKeyEvent>
 #include <QFontMetrics>
 #include <QGridLayout>
 #include <algorithm>
@@ -2327,7 +2328,81 @@ bool MainWindow::eventFilter(QObject *target, QEvent *event)
                 (event->type() == QEvent::KeyRelease))
             return true;
 
-    return false;
+        // R36S: D-pad in the Calibration Data list. The list takes the keys only after it is tapped.
+    //   Up / Down = move (Qt's own), Right = open a category and go to its first map,
+    //   Left = back to the category and close it, Enter (Y) = open the map, or bring it to the
+    //   front if it is already open (never closes it). While the list has the keys, the table
+    //   edit keys (+ / - and S) do nothing, so a table can't be changed by accident.
+    if (target == ui->calibrationDataTreeWidget &&
+        (event->type() == QEvent::KeyPress || event->type() == QEvent::ShortcutOverride))
+    {
+        QKeyEvent *ke = static_cast<QKeyEvent*>(event);
+        const int key = ke->key();
+        const bool listKey = key == Qt::Key_Left || key == Qt::Key_Right ||
+                             key == Qt::Key_Return || key == Qt::Key_Enter;
+        const bool editKey = key == Qt::Key_Plus || key == Qt::Key_Minus ||
+                             key == Qt::Key_Equal || key == Qt::Key_S;
+        if (event->type() == QEvent::ShortcutOverride)
+        {
+            if (!listKey && !editKey)
+                return false;
+            ke->accept();                 // the list gets the key, not a menu shortcut
+            return true;
+        }
+        if (editKey)
+            return true;                  // ignored while in the list
+        QTreeWidget *tree = ui->calibrationDataTreeWidget;
+        QTreeWidgetItem *item = tree->currentItem();
+        if (!listKey || !item)
+            return false;                 // Up / Down: Qt moves through the list
+        if (key == Qt::Key_Right)
+        {
+            if (item->childCount())
+            {
+                item->setExpanded(true);
+                tree->setCurrentItem(item->child(0));
+            }
+            return true;
+        }
+        if (key == Qt::Key_Left)
+        {
+            QTreeWidgetItem *top = item->parent() ? item->parent() : item;
+            tree->setCurrentItem(top);
+            top->setExpanded(false);
+            return true;
+        }
+        // Enter (Y)
+        if (!item->parent())
+        {
+            item->setExpanded(!item->isExpanded());   // on a category: open / close it
+            return true;
+        }
+        QList<QTreeWidgetItem*> roms = ui->calibrationFilesTreeWidget->selectedItems();
+        if (roms.isEmpty())
+            return true;
+        int romNumber = ui->calibrationFilesTreeWidget->indexOfTopLevelItem(roms.at(0));
+        int romIndex = roms.at(0)->text(2).toInt();
+        bool isMap = false;
+        int mapIndex = item->text(1).toInt(&isMap);
+        if (!isMap || romNumber < 0 || romNumber >= 100 || !ecuCalDef[romNumber] ||
+            mapIndex < 0 || mapIndex >= ecuCalDef[romNumber]->NameList.count() ||
+            mapIndex >= ecuCalDef[romNumber]->VisibleList.count())
+            return true;                  // ROM Info lines and anything else: nothing to open
+        if (ecuCalDef[romNumber]->VisibleList.at(mapIndex) == "1")
+        {
+            QString name = QString::number(romIndex) + "," + QString::number(mapIndex) + "," +
+                           ecuCalDef[romNumber]->NameList.at(mapIndex);
+            for (QMdiSubWindow *w : ui->mdiArea->subWindowList())
+                if (w->objectName().startsWith(name))
+                    ui->mdiArea->setActiveSubWindow(w);   // already open: to the front
+        }
+        else
+            calibration_data_treewidget_item_selected(item);   // opens it, same as a tap
+        QTimer::singleShot(0, tree, [tree]() { tree->setFocus(); });   // keep the D-pad in the list
+        return true;
+    }
+
+return false;
 }
 
 template <typename FLASH_CLASS>

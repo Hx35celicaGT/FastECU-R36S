@@ -1,3 +1,7 @@
+  // Modified for FastECU-R36S (R36S handheld running Arch R) by Victor, 2026-10.
+  // See CHANGES-R36S.md for what changed. Original FastECU: https://github.com/miikasyvanen/fastecu-oem (GPLv3).
+
+
 #include "calibration_treewidget.h"
 
 CalibrationTreeWidget::CalibrationTreeWidget()
@@ -54,7 +58,7 @@ QTreeWidget *CalibrationTreeWidget::buildCalibrationDataTree(QTreeWidget *dataTr
     QTreeWidget *calDataTree = dataTreeWidget;
 
     calDataTree->setAnimated(true);
-    calDataTree->setFocusPolicy(Qt::NoFocus);
+    calDataTree->setFocusPolicy(Qt::ClickFocus);
 
     QFont dataItemFont;
     dataItemFont.setPixelSize(12);
