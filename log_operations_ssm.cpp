@@ -3840,6 +3840,14 @@ protected:
             if (hidden)
             {
                 swallowed = true;
+                {
+                    // R36S: A while the calibration list has the D-pad acts on the highlighted map
+                    QWidget *fw = QApplication::focusWidget();
+                    if (event->type() == QEvent::MouseButtonPress && fw &&
+                        fw->objectName() == "calibrationDataTreeWidget" &&
+                        static_cast<QMouseEvent*>(event)->button() == Qt::LeftButton)
+                        QCoreApplication::postEvent(fw, new QKeyEvent(QEvent::KeyPress, Qt::Key_Select, Qt::NoModifier));
+                }
                 return true;             // pointer hidden: the click is ignored
             }
             idle->start();

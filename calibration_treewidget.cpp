@@ -59,6 +59,7 @@ QTreeWidget *CalibrationTreeWidget::buildCalibrationDataTree(QTreeWidget *dataTr
 
     calDataTree->setAnimated(true);
     calDataTree->setFocusPolicy(Qt::ClickFocus);
+    calDataTree->setStyleSheet("QTreeWidget::item:selected { background: #3b78c8; color: white; }");   // R36S: clear highlight
 
     QFont dataItemFont;
     dataItemFont.setPixelSize(12);

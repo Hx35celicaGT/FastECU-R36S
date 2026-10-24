@@ -354,6 +354,9 @@ MainWindow::MainWindow(QString peerAddress, QString peerPassword, QWidget *paren
     //connect(ui->action_Preferences, SIGNAL(triggered()), this, SLOT(openPreferences()));
     connect(ui->calibrationFilesTreeWidget, SIGNAL(itemClicked(QTreeWidgetItem *,int)), this, SLOT(calibration_files_treewidget_item_selected(QTreeWidgetItem*)));
     connect(ui->calibrationDataTreeWidget, SIGNAL(itemClicked(QTreeWidgetItem *,int)), this, SLOT(calibration_data_treewidget_item_selected(QTreeWidgetItem*)));
+        connect(ui->calibrationDataTreeWidget, &QTreeWidget::itemClicked, this, [this]() {   // R36S: after a tap the D-pad stays in the list
+        QTimer::singleShot(0, ui->calibrationDataTreeWidget, [this]() { ui->calibrationDataTreeWidget->setFocus(); });
+    });
     connect(ui->calibrationDataTreeWidget, SIGNAL(itemExpanded(QTreeWidgetItem*)), this, SLOT(calibration_data_treewidget_item_expanded(QTreeWidgetItem*)));
     connect(ui->calibrationDataTreeWidget, SIGNAL(itemCollapsed(QTreeWidgetItem*)), this, SLOT(calibration_data_treewidget_item_collapsed(QTreeWidgetItem*)));
     connect(calibrationTreeWidget, SIGNAL(closeRom()), this, SLOT(close_calibration()));
@@ -1909,18 +1912,10 @@ void MainWindow::calibration_data_treewidget_item_selected(QTreeWidgetItem* item
                         map_index++;
                         if (w->objectName().startsWith(QString::number(romIndex) + "," + QString::number(i) + "," + ecuCalDef[romNumber]->NameList.at(i)))
                         {
-                            if (w->objectName() == ui->mdiArea->activeSubWindow()->objectName())
-                            {
-                                ui->mdiArea->removeSubWindow(w);
-                                ecuCalDef[romNumber]->VisibleList.replace(i, "0");
-                                item->setCheckState(0, Qt::Unchecked);
-                            }
-                            else
-                            {
-                                w->setFocus();
-                                item->setCheckState(0, Qt::Checked);
-
-                            }
+                            // R36S: a tap on a ticked map always closes it (was: only when it was the window in front)
+                            w->close();
+                            ecuCalDef[romNumber]->VisibleList.replace(i, "0");
+                            item->setCheckState(0, Qt::Unchecked);
                         }
                     }
                 }
@@ -2339,7 +2334,7 @@ bool MainWindow::eventFilter(QObject *target, QEvent *event)
         QKeyEvent *ke = static_cast<QKeyEvent*>(event);
         const int key = ke->key();
         const bool listKey = key == Qt::Key_Left || key == Qt::Key_Right ||
-                             key == Qt::Key_Return || key == Qt::Key_Enter;
+                             key == Qt::Key_Return || key == Qt::Key_Enter || key == Qt::Key_Select;
         const bool editKey = key == Qt::Key_Plus || key == Qt::Key_Minus ||
                              key == Qt::Key_Equal || key == Qt::Key_S;
         if (event->type() == QEvent::ShortcutOverride)
@@ -2388,7 +2383,9 @@ bool MainWindow::eventFilter(QObject *target, QEvent *event)
             mapIndex < 0 || mapIndex >= ecuCalDef[romNumber]->NameList.count() ||
             mapIndex >= ecuCalDef[romNumber]->VisibleList.count())
             return true;                  // ROM Info lines and anything else: nothing to open
-        if (ecuCalDef[romNumber]->VisibleList.at(mapIndex) == "1")
+          if (key == Qt::Key_Select)
+              calibration_data_treewidget_item_selected(item);   // A: same as a tap - tick opens, untick closes
+          else if (ecuCalDef[romNumber]->VisibleList.at(mapIndex) == "1")
         {
             QString name = QString::number(romIndex) + "," + QString::number(mapIndex) + "," +
                            ecuCalDef[romNumber]->NameList.at(mapIndex);
