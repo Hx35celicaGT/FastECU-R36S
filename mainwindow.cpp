@@ -354,8 +354,13 @@ MainWindow::MainWindow(QString peerAddress, QString peerPassword, QWidget *paren
     //connect(ui->action_Preferences, SIGNAL(triggered()), this, SLOT(openPreferences()));
     connect(ui->calibrationFilesTreeWidget, SIGNAL(itemClicked(QTreeWidgetItem *,int)), this, SLOT(calibration_files_treewidget_item_selected(QTreeWidgetItem*)));
     connect(ui->calibrationDataTreeWidget, SIGNAL(itemClicked(QTreeWidgetItem *,int)), this, SLOT(calibration_data_treewidget_item_selected(QTreeWidgetItem*)));
-        connect(ui->calibrationDataTreeWidget, &QTreeWidget::itemClicked, this, [this]() {   // R36S: after a tap the D-pad stays in the list
-        QTimer::singleShot(0, ui->calibrationDataTreeWidget, [this]() { ui->calibrationDataTreeWidget->setFocus(); });
+    connect(ui->calibrationDataTreeWidget, &QTreeWidget::itemClicked, this, [this]() {   // R36S: after a tap the D-pad stays in the list, on the same item
+        QPersistentModelIndex keep(ui->calibrationDataTreeWidget->currentIndex());
+        QTimer::singleShot(100, ui->calibrationDataTreeWidget, [this, keep]() {
+            ui->calibrationDataTreeWidget->setFocus();
+            if (keep.isValid())
+                ui->calibrationDataTreeWidget->setCurrentIndex(keep);
+        });
     });
     connect(ui->calibrationDataTreeWidget, SIGNAL(itemExpanded(QTreeWidgetItem*)), this, SLOT(calibration_data_treewidget_item_expanded(QTreeWidgetItem*)));
     connect(ui->calibrationDataTreeWidget, SIGNAL(itemCollapsed(QTreeWidgetItem*)), this, SLOT(calibration_data_treewidget_item_collapsed(QTreeWidgetItem*)));
@@ -2395,7 +2400,12 @@ bool MainWindow::eventFilter(QObject *target, QEvent *event)
         }
         else
             calibration_data_treewidget_item_selected(item);   // opens it, same as a tap
-        QTimer::singleShot(0, tree, [tree]() { tree->setFocus(); });   // keep the D-pad in the list
+        QPersistentModelIndex keep(tree->currentIndex());   // keep the D-pad in the list, on the same item
+        QTimer::singleShot(100, tree, [tree, keep]() {
+            tree->setFocus();
+            if (keep.isValid())
+                tree->setCurrentIndex(keep);
+        });
         return true;
     }
 
