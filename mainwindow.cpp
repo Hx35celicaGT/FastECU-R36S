@@ -1917,8 +1917,11 @@ void MainWindow::calibration_data_treewidget_item_selected(QTreeWidgetItem* item
                         map_index++;
                         if (w->objectName().startsWith(QString::number(romIndex) + "," + QString::number(i) + "," + ecuCalDef[romNumber]->NameList.at(i)))
                         {
-                            // R36S: a tap on a ticked map always closes it (was: only when it was the window in front)
-                            w->close();
+                            // R36S: a tap on a ticked map always closes it (was: only when it was the window in front).
+                            // Closed like the original (without close_calibration_map, which resets the list), then freed.
+                            disconnect(w, SIGNAL(destroyed(QObject*)), this, SLOT(close_calibration_map(QObject*)));
+                            ui->mdiArea->removeSubWindow(w);
+                            w->deleteLater();
                             ecuCalDef[romNumber]->VisibleList.replace(i, "0");
                             item->setCheckState(0, Qt::Unchecked);
                         }
