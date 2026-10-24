@@ -1,5 +1,7 @@
 #include "settings.h"
 #include "ui_settings.h"
+#include <QGuiApplication>
+#include <QScreen>
 
 Settings::Settings(FileActions::ConfigValuesStructure *configValues, QWidget *parent)
     : QDialog(parent),
@@ -14,7 +16,9 @@ Settings::Settings(FileActions::ConfigValuesStructure *configValues, QWidget *pa
     ui->list_widget->setMovement(QListView::Static);
     ui->list_widget->setSizeAdjustPolicy(QAbstractScrollArea::AdjustToContents);
     //ui->list_widget->setFixedWidth(160);
-    ui->list_widget->setSpacing(10);
+    ui->list_widget->setFixedWidth(84);              // R36S: narrow icon column
+    ui->list_widget->setSpacing(4);
+    ui->contentLayout->setContentsMargins(6, 6, 6, 6); // R36S: was 20 on each side
 
     ui->dir_page->setLayout(create_files_config_page(configValues));
     ui->ui_page->setLayout(create_ui_config_page(configValues));
@@ -29,7 +33,14 @@ Settings::Settings(FileActions::ConfigValuesStructure *configValues, QWidget *pa
 
     QHBoxLayout *buttonsLayout = new QHBoxLayout;
     buttonsLayout->addStretch(1);
-
+    // R36S: keep the dialog inside the 640x480 screen
+    if (QScreen *screen = QGuiApplication::primaryScreen())
+    {
+        QRect avail = screen->availableGeometry();
+        setMaximumSize(avail.size());
+        resize(avail.size());
+        move(avail.topLeft());
+    }
 
 }
 
@@ -197,6 +208,7 @@ QVBoxLayout *Settings::create_ui_config_page(FileActions::ConfigValuesStructure 
     QGroupBox *toolbar_group = new QGroupBox(tr("Toolbar settings"));
     QLabel *toolbar_iconsize_label = new QLabel("Toolbar icon size:");
     toolbar_iconsize_spinbox = new QSpinBox();
+    toolbar_iconsize_spinbox->setRange(8, 64);      // R36S: add this line
     toolbar_iconsize_spinbox->setValue(configValues->toolbar_iconsize.toInt());
     connect(toolbar_iconsize_spinbox, SIGNAL(valueChanged(int)), this, SLOT(toolbar_iconsize_value_changed(int)));
 
