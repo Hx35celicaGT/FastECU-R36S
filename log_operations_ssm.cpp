@@ -3888,7 +3888,6 @@ private:
 };
 // ===== end R36S pointer =====
 
-
 // ===== R36S 2D / 3D graph (desktop 3) =====
 // A map window's title-bar menu (click the icon at its top-left) has "Send To 2D/3D Graph",
 // "Send X axis To 2D Graph" and "Send Y axis To 2D Graph". The table is drawn here as a picture
@@ -3896,8 +3895,15 @@ private:
 //   2D/3D:  a 3D map is drawn as a coloured surface; a map with one axis as a line.
 //   X axis: the map values against the X axis, one line for each Y row.
 //   Y axis: the map values against the Y axis, one line for each X column.
+// Crosshair: one table cell is marked, and its axis values and value are shown along the bottom.
+//   D-pad = move the crosshair one cell (in the direction it looks on screen)
+//   B (Esc) = put the crosshair on the point under the stick pointer (only while the pointer shows)
+//   A + stick (drag) = turn the 3D view       R2 / L2 (+ / -) = zoom in / out around the crosshair
+//   Y (Enter) = starting view and no zoom; the crosshair stays where it is
 #include <algorithm>
 #include <QKeyEvent>
+#include <QCursor>
+#include <QGuiApplication>
 
 struct R36SGraph
 {
@@ -3912,6 +3918,51 @@ static R36SGraph r36sGraph;
 
 static const double R36S_GRAPH_AZ0 = -32.0, R36S_GRAPH_EL0 = 30.0;   // starting 3D view (degrees)
 static double r36sGraphAz = R36S_GRAPH_AZ0, r36sGraphEl = R36S_GRAPH_EL0;   // current 3D view
+
+// Crosshair and zoom
+static const double R36S_GRAPH_ZOOM_MAX = 8.0, R36S_GRAPH_ZOOM_STEP = 1.25;
+static double r36sGraphZoom = 1.0;
+static int r36sGraphCol = 0, r36sGraphRow = 0;   // crosshair cell: col = X index, row = Y index
+static QString r36sGraphKey;                     // which table the crosshair belongs to
+static int r36sGraphLastMode = -1;
+static QVector<QPointF> r36sGraphPts;            // screen point of every cell from the last paint (row * cols + col)
+static QRectF r36sGraphPickArea;                 // where B can pick a point
+static QPointF r36sGraphVecCol, r36sGraphVecRow; // on screen: the whole X axis and the whole Y axis (for the D-pad)
+
+static void r36sGraphDims(const R36SGraph &g, int &cols, int &rows)
+{
+    rows = g.z.size();
+    cols = rows ? g.z.first().size() : 0;
+}
+
+// New table: crosshair to the middle and no zoom. Same table again (or live update): keep it.
+static void r36sGraphCheckCross(const R36SGraph &g)
+{
+    int cols, rows;
+    r36sGraphDims(g, cols, rows);
+    QString key = g.file + "|" + g.title + "|" + QString::number(cols) + "x" + QString::number(rows);
+    if (key != r36sGraphKey)
+    {
+        r36sGraphKey = key;
+        r36sGraphCol = cols / 2;
+        r36sGraphRow = rows / 2;
+        r36sGraphZoom = 1.0;
+    }
+    if (g.mode != r36sGraphLastMode)
+    {
+        r36sGraphLastMode = g.mode;
+        r36sGraphZoom = 1.0;
+    }
+    r36sGraphCol = qBound(0, r36sGraphCol, qMax(0, cols - 1));
+    r36sGraphRow = qBound(0, r36sGraphRow, qMax(0, rows - 1));
+}
+
+static void r36sGraphSetPt(int cols, int col, int row, const QPointF &pt)
+{
+    int k = row * cols + col;
+    if (col >= 0 && col < cols && k >= 0 && k < r36sGraphPts.size())
+        r36sGraphPts[k] = pt;
+}
 
 // Same colours as the map table: low = red, high = blue
 static QColor r36sGraphColor(double t)
@@ -3964,6 +4015,15 @@ static void r36sGraphLabels(QPainter &p, const QVector<QPointF> &at, const QStri
     }
 }
 
+// The crosshair dot: yellow with a black ring
+static void r36sGraphDot(QPainter &p, const QPointF &pt)
+{
+    p.setPen(QPen(Qt::black, 2));
+    p.setBrush(QColor(255, 230, 0));
+    p.drawEllipse(pt, 5.5, 5.5);
+    p.setBrush(Qt::NoBrush);
+}
+
 // Lines: values against one axis, one line for each step of the other axis
 static void r36sGraphPaintLines(QPainter &p, const QRect &area, const R36SGraph &g, const QPalette &pal)
 {
@@ -3977,6 +4037,10 @@ static void r36sGraphPaintLines(QPainter &p, const QRect &area, const R36SGraph 
     const int nSer = vsX ? g.z.size() : (g.z.isEmpty() ? 0 : g.z.first().size());
     if (nAx < 1 || nSer < 1)
         return;
+    int cols, rows;
+    r36sGraphDims(g, cols, rows);
+    const int crossAx = vsX ? r36sGraphCol : r36sGraphRow;    // crosshair: step on the axis
+    const int crossSer = vsX ? r36sGraphRow : r36sGraphCol;   // crosshair: which line
 
     QFontMetrics fm(p.font());
     double lo, hi;
@@ -3987,6 +4051,14 @@ static void r36sGraphPaintLines(QPainter &p, const QRect &area, const R36SGraph 
     double axLo = ax.first(), axHi = ax.first();
     for (double v : ax) { axLo = qMin(axLo, v); axHi = qMax(axHi, v); }
     if (axHi - axLo < 1e-9) { axLo -= 1; axHi += 1; }
+    if (r36sGraphZoom > 1.0 && crossAx < nAx)
+    {
+        // zoom: a narrower piece of the axis around the crosshair; the value scale stays the same
+        double span = (axHi - axLo) / r36sGraphZoom;
+        double from = qBound(axLo, ax.at(crossAx) - span / 2, axHi - span);
+        axLo = from;
+        axHi = from + span;
+    }
 
     const int L = fm.horizontalAdvance("-00000.0") + 8;
     const bool legend = nSer > 1;
@@ -3995,17 +4067,24 @@ static void r36sGraphPaintLines(QPainter &p, const QRect &area, const R36SGraph 
     QRect plot(area.x() + L, area.y() + fm.height() + 6, area.width() - L - R, area.height() - B - fm.height() - 6);
     if (plot.width() < 20 || plot.height() < 20)
         return;
+    r36sGraphPickArea = QRectF(plot);
 
     auto px = [&](double v) { return plot.left() + (v - axLo) / (axHi - axLo) * plot.width(); };
     auto py = [&](double v) { return plot.bottom() - (v - lo) / (hi - lo) * plot.height(); };
+    auto inView = [&](double x) { return x >= plot.left() - 0.5 && x <= plot.right() + 0.5; };
 
     // grid: a line at each axis step, five value lines
     p.setPen(QPen(pal.mid().color(), 1, Qt::DotLine));
     QVector<QPointF> xt;
+    QStringList xtText;
     for (int i = 0; i < nAx; i++)
     {
-        p.drawLine(QPointF(px(ax.at(i)), plot.top()), QPointF(px(ax.at(i)), plot.bottom()));
-        xt << QPointF(px(ax.at(i)), plot.bottom() + 3);
+        double x = px(ax.at(i));
+        if (!inView(x))
+            continue;
+        p.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()));
+        xt << QPointF(x, plot.bottom() + 3);
+        xtText << axText.value(i);
     }
     QVector<QPointF> yt;
     QStringList ytText;
@@ -4018,7 +4097,7 @@ static void r36sGraphPaintLines(QPainter &p, const QRect &area, const R36SGraph 
     }
     p.setPen(pal.text().color());
     p.drawRect(plot.adjusted(0, 0, -1, -1));
-    r36sGraphLabels(p, xt, axText, Qt::AlignHCenter);
+    r36sGraphLabels(p, xt, xtText, Qt::AlignHCenter);
     r36sGraphLabels(p, yt, ytText, Qt::AlignRight | Qt::AlignVCenter);
     p.drawText(QRect(plot.left(), plot.bottom() + fm.height() + 4, plot.width(), fm.height() + 2), Qt::AlignCenter, axName);
     p.drawText(QRect(area.x(), area.y(), area.width(), fm.height() + 2), Qt::AlignLeft | Qt::AlignVCenter, g.zName);
@@ -4029,6 +4108,9 @@ static void r36sGraphPaintLines(QPainter &p, const QRect &area, const R36SGraph 
     // one line per series, coloured low step = red .. high step = blue
     QVector<QPointF> ends;
     QStringList endText;
+    QVector<QPolygonF> lines;
+    p.save();
+    p.setClipRect(plot.adjusted(-4, -4, 4, 4));   // zoomed: lines stop at the plot edges
     for (int s = 0; s < nSer; s++)
     {
         QColor c = nSer > 1 ? r36sGraphColor(double(s) / (nSer - 1)) : pal.highlight().color();
@@ -4036,8 +4118,12 @@ static void r36sGraphPaintLines(QPainter &p, const QRect &area, const R36SGraph 
         for (int i = 0; i < nAx; i++)
         {
             double v = vsX ? g.z.at(s).value(i) : g.z.value(i).value(s);
-            line << QPointF(px(ax.at(i)), py(v));
+            QPointF pt(px(ax.at(i)), py(v));
+            line << pt;
+            if (vsX) r36sGraphSetPt(cols, i, s, pt);
+            else     r36sGraphSetPt(cols, s, i, pt);
         }
+        lines << line;
         p.setPen(QPen(c, 2));
         p.drawPolyline(line);
         p.setBrush(c);
@@ -4047,10 +4133,41 @@ static void r36sGraphPaintLines(QPainter &p, const QRect &area, const R36SGraph 
         p.setBrush(Qt::NoBrush);
         if (legend)
         {
-            ends << QPointF(plot.right() + 6, line.last().y());
+            // label at the right-most point in view
+            QPointF end = line.first();
+            bool found = false;
+            for (const QPointF &pt : line)
+                if (inView(pt.x()) && (!found || pt.x() > end.x())) { end = pt; found = true; }
+            ends << QPointF(plot.right() + 6, end.y());
             endText << serText.value(s);
         }
     }
+
+    // crosshair: dashed line at the axis step, a ring on every line there, the picked line thicker
+    if (crossAx < nAx && crossSer < nSer)
+    {
+        double x = px(ax.at(crossAx));
+        QColor c = nSer > 1 ? r36sGraphColor(double(crossSer) / (nSer - 1)) : pal.highlight().color();
+        p.setPen(QPen(c, 4));
+        p.drawPolyline(lines.at(crossSer));
+        p.setPen(QPen(pal.text().color(), 1, Qt::DashLine));
+        p.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()));
+        for (int s = 0; s < nSer; s++)
+        {
+            QColor cs = nSer > 1 ? r36sGraphColor(double(s) / (nSer - 1)) : pal.highlight().color();
+            p.setPen(QPen(Qt::black, 1));
+            p.setBrush(cs);
+            p.drawEllipse(lines.at(s).at(crossAx), 3.5, 3.5);
+        }
+        p.setBrush(Qt::NoBrush);
+        r36sGraphDot(p, lines.at(crossSer).at(crossAx));
+        QPointF along(px(ax.last()) - px(ax.first()), 0);                         // the axis: sideways
+        QPointF across = lines.last().at(crossAx) - lines.first().at(crossAx);    // first line to last line
+        r36sGraphVecCol = vsX ? along : across;
+        r36sGraphVecRow = vsX ? across : along;
+    }
+    p.restore();
+
     if (legend)
     {
         // series labels at the right end of each line, in the line's colour, no overlaps
@@ -4070,7 +4187,7 @@ static void r36sGraphPaintLines(QPainter &p, const QRect &area, const R36SGraph 
     }
 }
 
-// Surface: cells filled with the table colours. The view turns with a drag or the arrow keys.
+// Surface: cells filled with the table colours. The view turns with a drag (A + stick).
 static void r36sGraphPaintSurface(QPainter &p, const QRect &area, const R36SGraph &g, const QPalette &pal)
 {
     const int ny = g.z.size();
@@ -4097,8 +4214,8 @@ static void r36sGraphPaintSurface(QPainter &p, const QRect &area, const R36SGrap
         return QPointF(rx, ry * se - z * ce);
     };
     auto depthAt = [&](double u, double v) { double d; proj(u, v, 0, &d); return d; };
-    auto U = [&](int i) { return (g.x.at(i) - xLo) / (xHi - xLo); };
-    auto V = [&](int j) { return (g.y.at(j) - yLo) / (yHi - yLo); };
+    auto U = [&](int i) { return (g.x.value(i) - xLo) / (xHi - xLo); };
+    auto V = [&](int j) { return (g.y.value(j) - yLo) / (yHi - yLo); };
     auto W = [&](double val) { return (val - lo) / (hi - lo); };
 
     // fixed size for every angle, so the graph does not grow or shrink while it turns
@@ -4108,9 +4225,21 @@ static void r36sGraphPaintSurface(QPainter &p, const QRect &area, const R36SGrap
     if (room.width() < 40 || room.height() < 40)
         return;
     const double halfW = sqrt(0.5), halfH = sqrt(0.5 + zs * zs / 4);
-    double sc = qMin(room.width() / (2 * halfW), room.height() / (2 * halfH));
-    QPointF off = room.center();
+    const double sc0 = qMin(room.width() / (2 * halfW), room.height() / (2 * halfH));
+    // zoom: bigger, and the crosshair slides toward the middle (at 1x nothing moves)
+    const double zm = r36sGraphZoom;
+    const double sc = sc0 * zm;
+    const int cc = qBound(0, r36sGraphCol, nx - 1), cr = qBound(0, r36sGraphRow, ny - 1);
+    QPointF cp = proj(U(cc), V(cr), W(g.z[cr][cc]), nullptr);
+    QPointF off = room.center() - cp * (sc0 * (zm - 1.0 / zm));
     auto S = [&](double u, double v, double w) { return proj(u, v, w, nullptr) * sc + off; };
+
+    // the graph part of the page; when zoomed, nothing is drawn outside it
+    QRectF view(area.x(), area.y() + fm.height() + 4, area.width() - legendW, area.height() - fm.height() * 2 - 8);
+    r36sGraphPickArea = view;
+    p.save();
+    if (zm > 1.001)
+        p.setClipRect(view);
 
     // which sides are at the back (walls) and at the front (labels) from this angle
     const int farV = depthAt(0.5, 0) < depthAt(0.5, 1) ? 0 : 1, nearV = 1 - farV;
@@ -4154,21 +4283,54 @@ static void r36sGraphPaintSurface(QPainter &p, const QRect &area, const R36SGrap
     }
     p.setBrush(Qt::NoBrush);
 
+    // every table point on screen (for B), and the axes along the floor (for the D-pad)
+    r36sGraphVecCol = S(U(nx - 1), 0, 0) - S(U(0), 0, 0);
+    r36sGraphVecRow = S(0, V(ny - 1), 0) - S(0, V(0), 0);
+    for (int j = 0; j < ny; j++)
+        for (int i = 0; i < nx; i++)
+            r36sGraphSetPt(nx, i, j, S(U(i), V(j), W(g.z[j][i])));
+
+    // crosshair: its row and column traced over the surface, a dashed line down to the floor
+    QPolygonF rowLine, colLine;
+    for (int i = 0; i < nx; i++) rowLine << S(U(i), V(cr), W(g.z[cr][i]));
+    for (int j = 0; j < ny; j++) colLine << S(U(cc), V(j), W(g.z[j][cc]));
+    p.setPen(QPen(Qt::white, 4));
+    p.drawPolyline(rowLine);
+    p.drawPolyline(colLine);
+    p.setPen(QPen(Qt::black, 2));
+    p.drawPolyline(rowLine);
+    p.drawPolyline(colLine);
+    QPointF dot = S(U(cc), V(cr), W(g.z[cr][cc]));
+    p.setPen(QPen(Qt::black, 1, Qt::DashLine));
+    p.drawLine(dot, S(U(cc), V(cr), 0));
+    r36sGraphDot(p, dot);
+    QString tag = r36sGraphNum(g.z[cr][cc], hi - lo);
+    QRectF tagBox(dot + QPointF(9, -fm.height() - 6), QSizeF(fm.horizontalAdvance(tag) + 8, fm.height() + 2));
+    p.setPen(Qt::black);
+    p.setBrush(QColor(255, 255, 220));
+    p.drawRect(tagBox);
+    p.setBrush(Qt::NoBrush);
+    p.drawText(tagBox, Qt::AlignCenter, tag);
+
     // axis labels on the two front edges of the floor
     p.setPen(pal.text().color());
     QVector<QPointF> xa, ya;
     for (int i = 0; i < nx; i++) xa << S(U(i), nearV, 0) + QPointF(0, 3);
     for (int j = 0; j < ny; j++) ya << S(nearU, V(j), 0);
-    bool yRight = S(nearU, 0.5, 0).x() >= off.x();
+    bool yRight = S(nearU, 0.5, 0).x() >= room.center().x();
     for (QPointF &q : ya) q += QPointF(yRight ? 4 : -4, 0);
     r36sGraphLabels(p, xa, g.xText, Qt::AlignHCenter);
     r36sGraphLabels(p, ya, g.yText, (yRight ? Qt::AlignLeft : Qt::AlignRight) | Qt::AlignVCenter);
+    p.restore();
+
     QString names = "X: " + (g.xName.isEmpty() ? QString("steps") : g.xName) + "     Y: " + (g.yName.isEmpty() ? QString("steps") : g.yName);
     QRect caption(area.x(), area.bottom() - fm.height(), area.width() - legendW, fm.height() + 1);
+    p.setPen(pal.text().color());
     p.drawText(caption, Qt::AlignHCenter | Qt::AlignVCenter, fm.elidedText(names, Qt::ElideRight, caption.width()));
     p.setPen(pal.mid().color());
-    p.drawText(QRect(area.x(), area.y(), area.width() - legendW, fm.height() + 2), Qt::AlignLeft | Qt::AlignVCenter,
-               "Drag or arrows: turn     Enter: reset view");
+    QRect hint(area.x(), area.y(), area.width() - legendW - fm.horizontalAdvance(g.zName) - 8, fm.height() + 2);
+    p.drawText(hint, Qt::AlignLeft | Qt::AlignVCenter,
+               fm.elidedText("A+stick: turn   D-pad: move   B: pick   L2/R2: zoom   Y: reset", Qt::ElideRight, hint.width()));
 
     // colour legend on the right
     QRect bar(area.right() - legendW + 6, area.y() + fm.height() + 10, 12, area.height() - fm.height() * 2 - 24);
@@ -4188,6 +4350,35 @@ static void r36sGraphPaintSurface(QPainter &p, const QRect &area, const R36SGrap
     p.drawText(QRect(area.x(), area.y(), area.width(), fm.height() + 2), Qt::AlignRight | Qt::AlignVCenter, g.zName);
 }
 
+// Bottom line: the crosshair cell's axis values and its value
+static void r36sGraphReadout(QPainter &p, const QRect &r, const R36SGraph &g, const QPalette &pal)
+{
+    int cols, rows;
+    r36sGraphDims(g, cols, rows);
+    if (cols < 1 || rows < 1)
+        return;
+    double lo, hi;
+    r36sGraphRange(g, lo, hi);
+    double v = g.z.value(r36sGraphRow).value(r36sGraphCol);
+    QStringList parts;
+    if (cols > 1 || !g.xText.isEmpty())
+        parts << (g.xName.isEmpty() ? QString("X") : g.xName) + ": " + g.xText.value(r36sGraphCol, QString::number(r36sGraphCol + 1));
+    if (rows > 1 || !g.yText.isEmpty())
+        parts << (g.yName.isEmpty() ? QString("Y") : g.yName) + ": " + g.yText.value(r36sGraphRow, QString::number(r36sGraphRow + 1));
+    parts << (g.zName.isEmpty() ? QString("Value") : g.zName) + ": " + r36sGraphNum(v, hi - lo);
+    p.fillRect(r, pal.alternateBase());
+    p.setPen(pal.mid().color());
+    p.drawRect(r.adjusted(0, 0, -1, -1));
+    QFont bold = p.font();
+    bold.setBold(true);
+    p.save();
+    p.setFont(bold);
+    p.setPen(pal.text().color());
+    QRect t = r.adjusted(6, 0, -6, 0);
+    p.drawText(t, Qt::AlignLeft | Qt::AlignVCenter, QFontMetrics(bold).elidedText(parts.join("     "), Qt::ElideRight, t.width()));
+    p.restore();
+}
+
 static void r36sGraphPaint(QPainter &p, const QRect &r, const R36SGraph &g, const QPalette &pal)
 {
     p.fillRect(r, pal.base());
@@ -4203,24 +4394,38 @@ static void r36sGraphPaint(QPainter &p, const QRect &r, const R36SGraph &g, cons
                    "and pick Send To 2D/3D Graph\n\nL1 / R1: switch desktops");
         return;
     }
+    r36sGraphCheckCross(g);
+    int cols, rows;
+    r36sGraphDims(g, cols, rows);
+    r36sGraphPts = QVector<QPointF>(cols * rows, QPointF(-1e9, -1e9));
+
     QFont bold = f;
     bold.setBold(true);
     p.setFont(bold);
     p.setPen(pal.text().color());
     static const char *what[] = { "", "  -  X axis", "  -  Y axis" };
     QRect head(r.x() + 6, r.y() + 2, r.width() - 12, fm.height() + 4);
-    p.drawText(head, Qt::AlignLeft | Qt::AlignVCenter,
-               QFontMetrics(bold).elidedText(g.title + what[qBound(0, g.mode, 2)], Qt::ElideRight, head.width()));
+    QString zoomText = r36sGraphZoom > 1.001 ? QString("Zoom %1x").arg(r36sGraphZoom, 0, 'f', 1) : QString();
+    int zoomW = zoomText.isEmpty() ? 0 : QFontMetrics(bold).horizontalAdvance(zoomText) + 12;
+    p.drawText(head.adjusted(0, 0, -zoomW, 0), Qt::AlignLeft | Qt::AlignVCenter,
+               QFontMetrics(bold).elidedText(g.title + what[qBound(0, g.mode, 2)], Qt::ElideRight, head.width() - zoomW));
+    if (zoomW)
+    {
+        p.setPen(pal.highlight().color());
+        p.drawText(head, Qt::AlignRight | Qt::AlignVCenter, zoomText);
+    }
     p.setFont(f);
-    QRect area = r.adjusted(6, fm.height() + 8, -6, -4);
+    QRect readout(r.x() + 4, r.bottom() - fm.height() - 7, r.width() - 8, fm.height() + 6);
+    QRect area = r.adjusted(6, fm.height() + 8, -6, -(fm.height() + 12));
     if (g.mode == 0)
         r36sGraphPaintSurface(p, area, g, pal);
     else
         r36sGraphPaintLines(p, area, g, pal);
+    r36sGraphReadout(p, readout, g, pal);
 }
 // ===== end R36S 2D / 3D graph =====
-// The graph page. Only the 3D view reacts: drag with the mouse (or the stick pointer)
-// or use the arrow keys / D-pad to turn it, Enter (Y) puts it back to the starting view.
+// The graph page. A + stick (drag) turns the 3D view, the D-pad moves the crosshair,
+// B puts the crosshair under the pointer, R2 / L2 zoom, Y (Enter) resets the view and zoom.
 class R36SGraphBox : public QWidget
 {
 public:
@@ -4251,16 +4456,36 @@ protected:
     void mouseReleaseEvent(QMouseEvent *) override { dragging = false; }
     void keyPressEvent(QKeyEvent *e) override
     {
+        if (r36sGraph.mode < 0)
+        {
+            QWidget::keyPressEvent(e);
+            return;
+        }
         switch (e->key())
         {
-        case Qt::Key_Left:   turn(5, 0);  break;
-        case Qt::Key_Right:  turn(-5, 0); break;
-        case Qt::Key_Up:     turn(0, -5); break;
-        case Qt::Key_Down:   turn(0, 5);  break;
+        case Qt::Key_Left:   moveCross(-1, 0); break;
+        case Qt::Key_Right:  moveCross(1, 0);  break;
+        case Qt::Key_Up:     moveCross(0, -1); break;
+        case Qt::Key_Down:   moveCross(0, 1);  break;
+        case Qt::Key_Plus:
+        case Qt::Key_Equal:
+        case Qt::Key_PageUp:                     // R2: zoom in
+            r36sGraphZoom = qMin(R36S_GRAPH_ZOOM_MAX, r36sGraphZoom * R36S_GRAPH_ZOOM_STEP);
+            update();
+            break;
+        case Qt::Key_Minus:
+        case Qt::Key_PageDown:                   // L2: zoom out
+            r36sGraphZoom = qMax(1.0, r36sGraphZoom / R36S_GRAPH_ZOOM_STEP);
+            update();
+            break;
+        case Qt::Key_Escape:                     // B: crosshair to the point under the pointer
+            pickAtPointer();
+            break;
         case Qt::Key_Return:
-        case Qt::Key_Enter:
+        case Qt::Key_Enter:                      // Y: starting view, no zoom
             r36sGraphAz = R36S_GRAPH_AZ0;
             r36sGraphEl = R36S_GRAPH_EL0;
+            r36sGraphZoom = 1.0;
             update();
             break;
         default:
@@ -4278,6 +4503,72 @@ private:
         r36sGraphEl = qBound(0.0, r36sGraphEl + dEl, 90.0);  // from level with the floor to straight down
         update();
     }
+    static QPointF pt(int cols, int col, int row)
+    {
+        return r36sGraphPts.value(row * cols + col, QPointF(-1e9, -1e9));
+    }
+    // Move one cell. Left / Right go along the table axis that runs more sideways on screen,
+    // Up / Down along the other one, each in the direction that matches the screen.
+    void moveCross(int kx, int ky)
+    {
+        int cols, rows;
+        r36sGraphDims(r36sGraph, cols, rows);
+        if (cols < 1 || rows < 1)
+            return;
+        const int c0 = r36sGraphCol, r0 = r36sGraphRow;
+        QPointF vc = r36sGraphVecCol, vr = r36sGraphVecRow;      // whole X / Y axis on screen
+        bool drawn = pt(cols, c0, r0).x() > -1e8;
+        double lc = std::hypot(vc.x(), vc.y()), lr = std::hypot(vr.x(), vr.y());
+        bool colSideways;                       // true: Left / Right change the column
+        if (!drawn || (lc < 1 && lr < 1))
+            colSideways = r36sGraph.mode != 2;  // not drawn yet: table order
+        else if (lc < 1)
+            colSideways = false;
+        else if (lr < 1)
+            colSideways = true;
+        else
+            colSideways = std::fabs(vc.x()) / lc >= std::fabs(vr.x()) / lr;
+        QPointF v = (kx != 0) == colSideways ? vc : vr;          // the axis this key moves along
+        double along = kx != 0 ? v.x() * kx : v.y() * ky;        // > 0: + step goes the pressed way
+        int step = (drawn && along < 0) ? -1 : 1;
+        if (!drawn)
+            step = kx != 0 ? kx : -ky;
+        int c = c0, r = r0;
+        if ((kx != 0) == colSideways) c += step; else r += step;
+        if (c < 0 || c >= cols || r < 0 || r >= rows)
+            return;
+        r36sGraphCol = c;
+        r36sGraphRow = r;
+        update();
+    }
+    // B: only while the pointer shows, and only inside the graph
+    void pickAtPointer()
+    {
+        const QCursor *oc = QGuiApplication::overrideCursor();
+        if (oc && oc->shape() == Qt::BlankCursor)
+            return;                         // pointer hidden: B does nothing
+        QPointF at = mapFromGlobal(QCursor::pos());
+        if (!r36sGraphPickArea.contains(at))
+            return;
+        int cols, rows;
+        r36sGraphDims(r36sGraph, cols, rows);
+        double best = 60.0 * 60.0;          // nearest point, no further than 60 pixels
+        int bc = -1, br = -1;
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+            {
+                QPointF q = pt(cols, c, r);
+                if (!r36sGraphPickArea.adjusted(-6, -6, 6, 6).contains(q))
+                    continue;
+                double d2 = (q.x() - at.x()) * (q.x() - at.x()) + (q.y() - at.y()) * (q.y() - at.y());
+                if (d2 < best) { best = d2; bc = c; br = r; }
+            }
+        if (bc < 0)
+            return;
+        r36sGraphCol = bc;
+        r36sGraphRow = br;
+        update();
+    }
 };
 
 static QPointer<R36SGraphBox> r36sGraphView;
@@ -4288,6 +4579,7 @@ static QWidget *r36sGraphViewCreate(QWidget *parent)
     r36sGraphView = box;
     return box;
 }
+
 // ===== R36S desktops (L1 / R1) =====
 // L1 and R1 send Shift+Tab and Tab. On the FastECU screen and on the other desktops they
 // switch desktops; in dialogs (Log values, Set value, Settings ...) they stay Tab / Shift+Tab.
