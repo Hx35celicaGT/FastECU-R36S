@@ -1,4 +1,4 @@
-// Modified for FastECU-R36S (R36S handheld running Arch R) by Victor, 2026-09 to 2026-10.
+// Modified for FastECU-R36S (R36S handheld running Arch R)         Modified for FastECU-R36S by Victor, 2026-11-03
 // See CHANGES-R36S.md for what changed. Original FastECU: https://github.com/miikasyvanen/fastecu-oem (GPLv3).
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
@@ -403,8 +403,11 @@ static void r36sWriteAvailable(const QString &path, FileActions::LogValuesStruct
 //   arduino_port = auto            (or a port, e.g. /dev/ttyUSB1)
 //   arduino_baud = 115200          (optional, default 115200)
 //   arduino_units = fuel_temp:C    (optional unit overrides, column:unit, comma separated)
-// If the Nano has no serial port (the R36S kernel has no FTDI driver), FastECU talks
-// to its FTDI FT232R chip directly over USB instead (see "FTDI direct" below).
+//   arduino_channels = arduino_channels.txt   (optional; this is the default)
+// arduino_channels.txt (written by FlexCtl each time it connects) gives every column's name, unit
+// and the value that means "no reading" (-1, -99, -999). Without it the old built-in list is used.
+// If the Nano has no serial port (the R36S kernel has no FTDI or CH340 driver), FastECU talks
+// to its FTDI FT232R or CH340 chip directly over USB instead (see "FTDI direct" below).
 #include <QSerialPort>
 #include <QSerialPortInfo>
 #include <thread>
@@ -438,6 +441,43 @@ static QByteArray r36sArduinoBuffer;
 static QElapsedTimer r36sArduinoLastLine;
 static QHash<QString, QString> r36sArduinoUnits;
 
+// Column names, units and "no reading" values from arduino_channels.txt (FlexCtl writes it on connect)
+//   column = name | unit | value meaning no reading (blank = none) | decimals
+struct R36SArduinoChannel { QString name, unit; bool hasMissing = false; double missing = 0; };
+static QHash<QString, R36SArduinoChannel> r36sArduinoChannels;
+static QStringList r36sArduinoChannelOrder;
+
+static void r36sArduinoLoadChannels(const QString &path)
+{
+    r36sArduinoChannels.clear();
+    r36sArduinoChannelOrder.clear();
+    QFile f(path);
+    if (!f.open(QFile::ReadOnly | QFile::Text))
+        return;
+    QTextStream in(&f);
+    while (!in.atEnd())
+    {
+        QString line = in.readLine().trimmed();
+        if (line.isEmpty() || line.startsWith('#'))
+            continue;
+        int eq = line.indexOf('=');
+        if (eq <= 0)
+            continue;
+        QString col = line.left(eq).trimmed();
+        QStringList p = line.mid(eq + 1).split('|');
+        R36SArduinoChannel c;
+        c.name = p.value(0).trimmed();
+        c.unit = p.value(1).trimmed();
+        QString m = p.value(2).trimmed();
+        if (!m.isEmpty())
+            c.missing = m.toDouble(&c.hasMissing);
+        if (c.name.isEmpty())
+            c.name = col + " (Arduino)";
+        r36sArduinoChannels.insert(col, c);
+        r36sArduinoChannelOrder << col;
+    }
+}
+
 void r36sArduinoSetEcuPort(const QString &port)
 {
     r36sArduinoEcuPort = port.split(" - ").at(0).trimmed();
@@ -460,6 +500,11 @@ static void r36sArduinoAddColumn(FileActions::LogValuesStructure *lv, const QStr
     QString name = col + " (Arduino)", unit;
     for (const R36SArduinoColumn &c : R36S_ARDUINO_COLUMNS)
         if (col == c.col) { name = c.name; unit = c.unit; }
+    if (r36sArduinoChannels.contains(col))
+    {
+        name = r36sArduinoChannels.value(col).name;
+        unit = r36sArduinoChannels.value(col).unit;
+    }
     if (r36sArduinoUnits.contains(col))
         unit = r36sArduinoUnits.value(col);
     lv->log_value_protocol.append(r36sArduinoProtocol);
@@ -478,12 +523,17 @@ static void r36sArduinoAddColumn(FileActions::LogValuesStructure *lv, const QStr
     lv->log_value_endian.append("big");
 }
 
-static bool r36sArduinoMinusOneIsMissing(const QString &col)
+// True if v means "no reading" for this column: from arduino_channels.txt, else the old -1 rule
+static bool r36sArduinoIsMissing(const QString &col, double v)
 {
+    QHash<QString, R36SArduinoChannel>::const_iterator it = r36sArduinoChannels.constFind(col);
+    if (it != r36sArduinoChannels.constEnd())
+        return it.value().hasMissing && v == it.value().missing;
     for (const R36SArduinoColumn &c : R36S_ARDUINO_COLUMNS)
-        if (col == c.col) return c.minusOneIsMissing;
+        if (col == c.col) return c.minusOneIsMissing && v == -1;
     return false;
 }
+
 
 static void r36sArduinoLine(const QByteArray &raw)
 {
@@ -501,14 +551,18 @@ static void r36sArduinoLine(const QByteArray &raw)
     }
     if (r36sArduinoColumns.isEmpty())
     {
-        // Header missed (Nano was already running): accept lines in the sketch's known column order
+        // Header missed (Nano was already running): accept lines in the known column order,
+        // from arduino_channels.txt if there is one, else the old built-in list
+        QStringList known = r36sArduinoChannelOrder;
+        if (known.isEmpty())
+            for (const R36SArduinoColumn &c : R36S_ARDUINO_COLUMNS) known << c.col;
         QStringList parts = line.split(',');
-        const int known = sizeof(R36S_ARDUINO_COLUMNS) / sizeof(R36S_ARDUINO_COLUMNS[0]);
-        bool numeric = (parts.length() == known);
+        bool numeric = (parts.length() == known.length());
         for (const QString &p : parts) { bool ok = false; p.trimmed().toDouble(&ok); numeric = numeric && ok; }
         if (!numeric)
             return;                              // I2C scan lines etc. before the header
-        for (const R36SArduinoColumn &c : R36S_ARDUINO_COLUMNS) r36sArduinoColumns << c.col;
+        r36sArduinoColumns = known;
+        for (const QString &c : r36sArduinoColumns) r36sArduinoAddColumn(lv, c);
     }
     QStringList parts = line.split(',');
     if (parts.length() != r36sArduinoColumns.length())
@@ -521,7 +575,7 @@ static void r36sArduinoLine(const QByteArray &raw)
         if (j < 0) continue;
         bool ok = false;
         double v = parts.at(i).trimmed().toDouble(&ok);
-        if (!ok || (r36sArduinoMinusOneIsMissing(col) && v == -1))
+        if (!ok || r36sArduinoIsMissing(col, v))
         {
             lv->log_value.replace(j, "--");      // no reading: shown as -- and left out of min/max
             continue;
@@ -574,8 +628,48 @@ static void r36sFtdiBaudValue(int baud, int &value, int &index)
     index = (enc >> 16) & 0xFFFF;
 }
 
-// Find an FT232R (0403:6001) in /sys and open it through usbfs
-static int r36sFtdiOpenDevice(QString &name)
+// CH340 / CH341 setup, the same as the Linux ch341 driver: read version, init, baud, 8N1, DTR/RTS
+static int r36sCh340Version(int fd)
+{
+    unsigned char buf[2] = { 0, 0 };
+    struct usbdevfs_ctrltransfer c;
+    memset(&c, 0, sizeof(c));
+    c.bRequestType = 0xC0;                       // vendor request, device to host
+    c.bRequest = 0x5F;                           // read version
+    c.wLength = 2;
+    c.timeout = 1000;
+    c.data = buf;
+    return ioctl(fd, USBDEVFS_CONTROL, &c) >= 0 ? buf[0] : -1;
+}
+
+static int r36sCh340BaudValue(int baud)          // 115200 gives 0xCC03
+{
+    uint32_t factor = 1532620800u / (uint32_t)baud;
+    int divisor = 3;
+    while (factor > 0xFFF0 && divisor) { factor >>= 3; divisor--; }
+    factor = 0x10000 - factor;
+    return (factor & 0xFF00) | divisor;
+}
+
+static bool r36sCh340Modem(int fd, bool on)      // DTR + RTS, sent inverted
+{
+    return r36sFtdiControl(fd, 0xA4, (~(on ? 0x60 : 0x00)) & 0xFFFF, 0);
+}
+
+static bool r36sCh340Setup(int fd, int baud)
+{
+    int version = r36sCh340Version(fd);
+    if (version < 0) return false;
+    int val = r36sCh340BaudValue(baud);
+    if (version > 0x27) val |= 0x80;             // send short packets at once
+    return r36sFtdiControl(fd, 0xA1, 0, 0)                               // serial init
+        && r36sFtdiControl(fd, 0x9A, 0x1312, val)                        // baud rate
+        && (version < 0x30 || r36sFtdiControl(fd, 0x9A, 0x2518, 0xC3))   // 8N1, RX + TX on
+        && r36sCh340Modem(fd, true);
+}
+
+// Find an FT232R (0403:6001) or CH340 (1a86:7523 / 1a86:5523) in /sys and open it through usbfs
+static int r36sFtdiOpenDevice(QString &name, bool &isCh340)
 {
     QDir sys("/sys/bus/usb/devices");
     for (const QString &d : sys.entryList(QDir::Dirs | QDir::NoDotAndDotDot))
@@ -584,8 +678,10 @@ static int r36sFtdiOpenDevice(QString &name)
             QFile f(sys.filePath(d) + "/" + a);
             return f.open(QFile::ReadOnly) ? QString(f.readAll()).trimmed() : QString();
         };
-        if (readAttr("idVendor") != "0403" || readAttr("idProduct") != "6001")
+        QString id = readAttr("idVendor") + ":" + readAttr("idProduct");
+        if (id != "0403:6001" && id != "1a86:7523" && id != "1a86:5523")
             continue;
+        isCh340 = id.startsWith("1a86");
         QString path = QString("/dev/bus/usb/%1/%2").arg(readAttr("busnum").toInt(), 3, 10, QChar('0'))
                                                     .arg(readAttr("devnum").toInt(), 3, 10, QChar('0'));
         int fd = ::open(path.toLatin1().constData(), O_RDWR);
@@ -597,7 +693,7 @@ static int r36sFtdiOpenDevice(QString &name)
             ::close(fd);                         // a driver owns it (then it has a serial port anyway)
             continue;
         }
-        name = "FTDI " + readAttr("product") + " at " + path;
+        name = (isCh340 ? "CH340 " : "FTDI ") + readAttr("product") + " at " + path;
         return fd;
     }
     return -1;
@@ -621,16 +717,23 @@ static bool r36sFtdiStart(int baud, QString &status)
 {
     r36sFtdiStop();
     QString name;
-    int fd = r36sFtdiOpenDevice(name);
+    bool ch340 = false;
+    int fd = r36sFtdiOpenDevice(name, ch340);
     if (fd < 0)
         return false;
-    int value = 0, index = 0;
-    r36sFtdiBaudValue(baud, value, index);
-    bool ok = r36sFtdiControl(fd, 0, 0, 1)                 // reset
-           && r36sFtdiControl(fd, 3, value, index)         // baud rate
-           && r36sFtdiControl(fd, 4, 8, 1)                 // 8 data bits, no parity, 1 stop bit
-           && r36sFtdiControl(fd, 2, 0, 1)                 // no flow control
-           && r36sFtdiControl(fd, 9, 16, 1);               // latency timer 16 ms
+    bool ok;
+    if (ch340)
+        ok = r36sCh340Setup(fd, baud);
+    else
+    {
+        int value = 0, index = 0;
+        r36sFtdiBaudValue(baud, value, index);
+        ok = r36sFtdiControl(fd, 0, 0, 1)                  // reset
+          && r36sFtdiControl(fd, 3, value, index)          // baud rate
+          && r36sFtdiControl(fd, 4, 8, 1)                  // 8 data bits, no parity, 1 stop bit
+          && r36sFtdiControl(fd, 2, 0, 1)                  // no flow control
+          && r36sFtdiControl(fd, 9, 16, 1);                // latency timer 16 ms
+    }
     if (!ok)
     {
         unsigned int iface = 0;
@@ -640,19 +743,29 @@ static bool r36sFtdiStart(int baud, QString &status)
         return true;
     }
     // Pulse DTR to restart the Nano, so its header line is sent again
-    r36sFtdiControl(fd, 1, 0x0101, 1);
-    QThread::msleep(50);
-    r36sFtdiControl(fd, 1, 0x0100, 1);
+    if (ch340)
+    {
+        r36sCh340Modem(fd, false);
+        QThread::msleep(50);
+        r36sCh340Modem(fd, true);
+    }
+    else
+    {
+        r36sFtdiControl(fd, 1, 0x0101, 1);
+        QThread::msleep(50);
+        r36sFtdiControl(fd, 1, 0x0100, 1);
+    }
+
 
     r36sFtdiFd = fd;
     r36sFtdiName = name;
     r36sFtdiRun = true;
-    r36sFtdiThread = std::thread([fd]() {
+      r36sFtdiThread = std::thread([fd, ch340]() {
         unsigned char buf[512];
         while (r36sFtdiRun)
         {
             struct usbdevfs_bulktransfer b;
-            b.ep = 0x81;
+            b.ep = ch340 ? 0x82 : 0x81;
             b.len = sizeof(buf);
             b.timeout = 200;
             b.data = buf;
@@ -662,13 +775,18 @@ static bool r36sFtdiStart(int baud, QString &status)
                 if (errno == ETIMEDOUT) continue;
                 break;                               // unplugged; reopened on next Logging on
             }
-            // Every 64-byte USB packet starts with 2 FTDI status bytes
-            QByteArray data;
-            for (int p = 0; p < n; p += 64)
+             QByteArray data;
+            if (ch340)
+                data.append(reinterpret_cast<const char*>(buf), n);   // CH340: plain data
+            else
             {
-                int end = qMin(p + 64, n);
-                if (end - p > 2)
-                    data.append(reinterpret_cast<const char*>(buf + p + 2), end - p - 2);
+                // Every 64-byte USB packet starts with 2 FTDI status bytes
+                for (int p = 0; p < n; p += 64)
+                {
+                    int end = qMin(p + 64, n);
+                    if (end - p > 2)
+                        data.append(reinterpret_cast<const char*>(buf + p + 2), end - p - 2);
+                }
             }
             if (!data.isEmpty())
             {
@@ -733,6 +851,7 @@ static QString r36sArduinoFindPort(const QString &setting)
 QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString &protocol)
 {
     QString portSetting, baud = "115200";
+    QString channelsPath = QDir(R36S_FILES_DIR).filePath("arduino_channels.txt");
     r36sArduinoUnits.clear();
     QFile f(QDir(R36S_FILES_DIR).filePath("log_setup.txt"));
     if (f.open(QFile::ReadOnly | QFile::Text))
@@ -748,6 +867,8 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
             QString val = line.mid(eq + 1).trimmed();
             if (kind == "arduino_port") portSetting = val;
             else if (kind == "arduino_baud") baud = val;
+            else if (kind == "arduino_channels")
+                channelsPath = QDir::isAbsolutePath(val) ? val : QDir(R36S_FILES_DIR).filePath(val);
             else if (kind == "arduino_units")
                 for (const QString &pair : val.split(',', Qt::SkipEmptyParts))
                 {
@@ -765,7 +886,10 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
 
     r36sArduinoLv = lv;
     r36sArduinoProtocol = protocol;
-    for (const R36SArduinoColumn &c : R36S_ARDUINO_COLUMNS) r36sArduinoAddColumn(lv, c.col);
+    r36sArduinoLoadChannels(channelsPath);
+    if (r36sArduinoChannelOrder.isEmpty())       // no channel file: the old built-in columns
+        for (const R36SArduinoColumn &c : R36S_ARDUINO_COLUMNS) r36sArduinoAddColumn(lv, c.col);
+    for (const QString &c : r36sArduinoChannelOrder) r36sArduinoAddColumn(lv, c);
     for (const QString &c : r36sArduinoColumns) r36sArduinoAddColumn(lv, c);
 
     if (!r36sArduinoPort)
@@ -804,13 +928,12 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
     QString port = r36sArduinoFindPort(portSetting);
     if (port.isEmpty())
     {
-        // No serial port for the Nano (e.g. no FTDI driver on the R36S): talk to the chip directly
+        // No serial port for the Nano (no FTDI / CH340 driver on the R36S): talk to the chip directly
         QString status;
         r36sArduinoColumns.clear();
         r36sArduinoBuffer.clear();
         if (r36sFtdiStart(baud.toInt() > 0 ? baud.toInt() : 115200, status))
-            return QStringList() << status;
-        return QStringList() << "Arduino: no USB serial port or FTDI chip found besides the OBD cable (" + r36sArduinoEcuPort + ")";
+        return QStringList() << "Arduino: no USB serial port, FTDI or CH340 chip found besides the OBD cable (" + r36sArduinoEcuPort + ")";
     }
     r36sArduinoPort->setPortName(port);
     r36sArduinoPort->setBaudRate(baud.toInt() > 0 ? baud.toInt() : 115200);
