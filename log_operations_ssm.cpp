@@ -1710,12 +1710,17 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
     }
 
     // What this ECU (and the Arduino) supports, known after Connect to ECU. Math channels are added separately.
-    QStringList names, switchNames;
+    QStringList names, ardNames, switchNames;   // ECU values, then Arduino values at the bottom
     for (int j = 0; j < lv->log_value_id.length(); j++)
         if (lv->log_value_protocol.at(j) == protocol && lv->log_value_enabled.at(j) == "1" &&
             !lv->log_value_address.at(j).isEmpty() && lv->log_value_ecu_byte_index.at(j) != "math" &&
-            !names.contains(lv->log_value_name.at(j)))
-            names.append(lv->log_value_name.at(j));
+            !names.contains(lv->log_value_name.at(j)) && !ardNames.contains(lv->log_value_name.at(j)))
+        {
+            if (lv->log_value_ecu_byte_index.at(j) == "ard")
+                ardNames.append(lv->log_value_name.at(j));
+            else
+                names.append(lv->log_value_name.at(j));
+        }
     for (int j = 0; j < lv->log_switch_id.length(); j++)
         if (lv->log_switch_protocol.at(j) == protocol && lv->log_switch_enabled.at(j) == "1" &&
             !switchNames.contains(lv->log_switch_name.at(j)))
@@ -1726,6 +1731,8 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
         return false;
     }
     names.sort(Qt::CaseInsensitive);
+    ardNames.sort(Qt::CaseInsensitive);
+    names += ardNames;                           // Arduino values listed after all ECU values
     switchNames.sort(Qt::CaseInsensitive);
 
     // Math channels from log_setup.txt: simple ones go in the Math tab rows, formulas are read-only
