@@ -411,6 +411,7 @@ static void r36sWriteAvailable(const QString &path, FileActions::LogValuesStruct
 #include <QSerialPort>
 #include <QSerialPortInfo>
 #include <thread>
+#include <chrono>   // R36S
 #include <mutex>
 #include <atomic>
 #include <cerrno>
@@ -732,7 +733,7 @@ static bool r36sFtdiStart(int baud, QString &status)
           && r36sFtdiControl(fd, 3, value, index)          // baud rate
           && r36sFtdiControl(fd, 4, 8, 1)                  // 8 data bits, no parity, 1 stop bit
           && r36sFtdiControl(fd, 2, 0, 1)                  // no flow control
-          && r36sFtdiControl(fd, 9, 16, 1);                // latency timer 16 ms
+          && r36sFtdiControl(fd, 9, 2, 1);                 // latency timer 2 ms (R36S: short USB waits)
     }
     if (!ok)
     {
@@ -770,6 +771,10 @@ static bool r36sFtdiStart(int baud, QString &status)
             b.timeout = 200;
             b.data = buf;
             int n = ioctl(fd, USBDEVFS_BULK, &b);
+                        // R36S: rest between reads so the R36S USB port isn't kept busy nonstop (that slowed
+            // the Tactrix reads). The FTDI chip holds incoming bytes; the Nano sends ~20 bytes per 20 ms.
+            if (!ch340)
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
             if (n < 0)
             {
                 if (errno == ETIMEDOUT) continue;

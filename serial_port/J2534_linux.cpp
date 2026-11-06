@@ -278,6 +278,33 @@ long J2534::PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg, unsign
     //emit LOG_D("Recieved data: " + parseMessageToHex(received), true, true);
     while (received.length() > 0 && is_serial_port_open())
     {
+        //added 11-6-2026
+        // R36S: resync. Every adapter message starts with "ar". If a byte was lost the old
+        // code kept appending to a buffer that never started with "ar" and never returned.
+        if (!received.startsWith("ar"))
+        {
+            int at = received.indexOf("ar");
+            if (at > 0)
+                received.remove(0, at);
+            else
+                received = received.endsWith('a') ? QByteArray("a") : QByteArray();
+            QByteArray more = read_serial_data(3, Timeout);
+            if (more.isEmpty())
+                break;
+            received.append(more);
+            continue;
+        }
+        if (received.length() < 3)
+        {
+            QByteArray more = read_serial_data(3 - received.length(), Timeout);
+            if (more.isEmpty())
+                break;
+            received.append(more);
+            continue;
+        }
+
+        ///added
+
         //emit LOG_D("Message header: " + parseMessageToHex(received), true, true);
         if (received.at(0) == 0x61 && received.at(1) == 0x72)
         {
@@ -528,6 +555,8 @@ long J2534::PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg, unsign
                     stop_reading = true;
                 }
             }
+            else
+                received.remove(0, 2);   // R36S: unknown "ar?" header, resync
         }
         if (!stop_reading)
         {
