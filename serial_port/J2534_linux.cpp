@@ -58,6 +58,8 @@ void J2534::close_serial_port()
         serial->close();
         delay(100);
     }
+    jack_open = false;   // R36S: the jack channel closes with the port
+    jack_rx.clear();
     opened_serial_port = "";
 }
 
@@ -136,6 +138,47 @@ bool J2534::get_is_tx_done()
 {
     return is_tx_done;
 }
+
+
+// R36S: hand over the 2.5 mm jack bytes collected so far
+QByteArray J2534::take_jack_data()
+{
+    QByteArray out = jack_rx;
+    jack_rx.clear();
+    return out;
+}
+
+
+// R36S: read until 'end' arrives, but give up after 'max' bytes. A real adapter text reply is a short
+// line; binary 2.5 mm jack data that happens to contain "arr", "arm" ... would otherwise keep these
+// loops reading for as long as the jack streams (a logging stall). True = 'end' was found.
+bool J2534::r36s_read_line(QByteArray &buf, uint8_t end, int max, unsigned long timeout)
+{
+    while (buf.isEmpty() || (uint8_t)buf.at(buf.length() - 1) != end)
+    {
+        if (buf.length() >= max)
+            return false;
+        QByteArray more = read_serial_data(1, timeout);
+        if (more.isEmpty())
+            return false;
+        buf.append(more);
+    }
+    return true;
+}
+
+// R36S: close the 2.5 mm jack channel (Logging off) so its data doesn't pile up unread,
+// then drop whatever already arrived. It is opened again by the next take_jack_data().
+void J2534::close_jack()
+{
+    if (!jack_open)
+        return;
+    PassThruDisconnect(9);
+    delay(30);
+    serial->clear(QSerialPort::Input);
+    jack_open = false;
+    jack_rx.clear();
+}
+
 
 QString J2534::parseMessageToHex(QByteArray received)
 {
@@ -227,6 +270,9 @@ long J2534::PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID, un
     case CAN_CH1:
         pChannelID = (unsigned long*)CAN_CH1;
         break;
+    case 9:   // R36S: OP2 2.5 mm jack (receive-only serial, Innovate MTS)
+        pChannelID = (unsigned long*)9;
+        break;                
     default:
         return 0;//J2534_ERR_INVALID_PROTOCOL_ID;
     }
@@ -273,6 +319,8 @@ long J2534::PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg, unsign
     QString msg_type_string = 0;
     unsigned long msg_byte_cnt = 0;
     bool stop_reading = false;
+    QElapsedTimer read_timer;   // R36S: jack frames keep arriving, so give up after Timeout anyway
+    read_timer.start();
 
     received = read_serial_data(3, Timeout);
     //emit LOG_D("Recieved data: " + parseMessageToHex(received), true, true);
@@ -326,13 +374,19 @@ long J2534::PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg, unsign
             {
                 received.append(read_serial_data(2, Timeout));
                 msg.clear();
-                while ((uint8_t)msg[msg.length()-1] != 0x20)
-                    msg.append(read_serial_data(1, Timeout));
+                if (!r36s_read_line(msg, 0x20, 16, Timeout))
+                {
+                    received = received.mid(2) + msg;   // R36S: not a real "arm" reply, resync
+                    continue;
+                }
                 received.append(msg);
                 periodic_msg_id = msg.remove(msg.length()-1, 1).toULong();
 
-                while ((uint8_t)msg[msg.length()-1] != 0x0a)
-                    msg.append(read_serial_data(1, Timeout));
+                if (!r36s_read_line(msg, 0x0a, 64, Timeout))
+                {
+                    received = received.mid(2) + msg;
+                    continue;
+                }
                 received.append(msg);
                 msg = read_serial_data(msg_byte_cnt, Timeout);
                 received.append(msg);
@@ -342,8 +396,11 @@ long J2534::PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg, unsign
             }
             else if (received.at(2) == 'r') // 0x72
             {
-                while ((uint8_t)received.at(received.length()-1) != 0x0a)
-                    received.append(read_serial_data(1, Timeout));
+                if (!r36s_read_line(received, 0x0a, 64, Timeout))
+                {
+                    received.remove(0, 2);   // R36S: binary jack bytes that only looked like "arr", resync
+                    continue;
+                }
                 for (int i = 0; i < received.length(); i++)
                     pMsg->Data[i] = (uint8_t)received.at(i);
                 pMsg->DataSize = received.length();
@@ -353,8 +410,11 @@ long J2534::PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg, unsign
             }
             else if (received.at(2) == 'w') // 0x77
             {
-                while ((uint8_t)received.at(received.length()-1) != 0x0a)
-                    received.append(read_serial_data(1, Timeout));
+                if (!r36s_read_line(received, 0x0a, 64, Timeout))
+                {
+                    received.remove(0, 2);   // R36S: binary jack bytes that only looked like "arw", resync
+                    continue;
+                }
                 for (int i = 0; i < received.length(); i++)
                     pMsg->Data[i] = (uint8_t)received.at(i);
                 pMsg->DataSize = received.length();
@@ -366,13 +426,24 @@ long J2534::PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg, unsign
             {
                 received.append(read_serial_data(2, Timeout));
                 msg.clear();
-                while ((uint8_t)msg[msg.length()-1] != 0x20)
-                    msg.append(read_serial_data(1, Timeout));
+                if (!r36s_read_line(msg, 0x20, 16, Timeout))
+                {
+                    received = received.mid(2) + msg;   // R36S: not a real "ary" reply, resync
+                    continue;
+                }
                 received.append(msg);
                 msg_byte_cnt = msg.remove(msg.length()-1, 1).toInt();
+                if (msg_byte_cnt > 255)
+                {
+                    received.clear();
+                    continue;
+                }
 
-                while ((uint8_t)msg[msg.length()-1] != 0x0a)
-                    msg.append(read_serial_data(1, Timeout));
+                if (!r36s_read_line(msg, 0x0a, 64, Timeout))
+                {
+                    received = received.mid(2) + msg;
+                    continue;
+                }
                 received.append(msg);
                 msg = read_serial_data(msg_byte_cnt, Timeout);
                 received.append(msg);
@@ -386,6 +457,28 @@ long J2534::PassThruReadMsgs(unsigned long ChannelID, PASSTHRU_MSG *pMsg, unsign
                 msg_cnt++;
                 //emit LOG_D("Fast init msg response: " + parseMessageToHex(received), true, true);
             }
+            
+            else if (received.at(2) == '9')   // R36S: 2.5 mm jack frame: "ar9" <len> <type> <data>
+            {
+                QByteArray frame = received.mid(3);           // anything already read past "ar9"
+                if (frame.isEmpty())
+                    frame = read_serial_data(1, Timeout);
+                if (frame.isEmpty())
+                    break;
+                int len = (uint8_t)frame.at(0);
+                if (frame.length() < len + 1)
+                    frame.append(read_serial_data(len + 1 - frame.length(), Timeout));
+                if (frame.length() < len + 1)
+                    break;                                     // timed out inside the frame
+                if (len > 1 && (uint8_t)frame.at(1) == NORM_MSG)
+                    jack_rx.append(frame.mid(2, len - 1));     // data; start/end frames only carry a timestamp
+                if (jack_rx.size() > 65536)
+                    jack_rx.remove(0, jack_rx.size() - 65536); // nobody is taking it: keep the newest
+                received = frame.mid(len + 1);                 // bytes read past this frame
+                if (read_timer.elapsed() > (qint64)Timeout)
+                    break;
+            }
+
             else if (received.at(2) == '3' || received.at(2) == '4' || received.at(2) == '5' || received.at(2) == '6')
             {
                 received.append(read_serial_data(2, Timeout));

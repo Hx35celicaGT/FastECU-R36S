@@ -8,6 +8,7 @@
 #include <QSerialPort>
 #include <QSerialPortInfo>
 #include <QTime>
+#include <QElapsedTimer>   // R36S AUX Logging
 
 #include <stdint.h>
 
@@ -64,6 +65,12 @@ public:
     uint32_t parse_ts(const char *data);
     bool get_is_tx_done();
 
+    // R36S: Tactrix 2.5 mm jack (channel 9, receive-only). Its bytes arrive mixed into the
+    // adapter stream and are collected by PassThruReadMsgs while the K-line is read.
+    bool jack_open = false;
+    QByteArray take_jack_data();
+    void close_jack();            // R36S: Logging off
+
 private:
     bool debugMode;
 
@@ -83,6 +90,8 @@ private:
 
     bool msg_ack = false;
     bool is_tx_done = false;
+    QByteArray jack_rx;           // R36S: jack bytes not yet taken
+    bool r36s_read_line(QByteArray &buf, uint8_t end, int max, unsigned long timeout);    
 
     enum rx_msg_type {
         NORM_MSG,

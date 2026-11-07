@@ -1146,7 +1146,26 @@ QString SerialPortActions::open_serial_port()
         return qtrohelper::slot_sync(serial_remote->open_serial_port());
 }
 
+// R36S: Tactrix 2.5 mm jack bytes collected since the last call (direct connection only)
+QByteArray SerialPortActions::take_jack_data(int baud)
+{
+    if (isDirectConnection())
+        return serial_direct->take_jack_data(baud);
+    return QByteArray();
+}
+
+
+// R36S: close the Tactrix 2.5 mm jack channel (Logging off, direct connection only)
+void SerialPortActions::close_jack()
+{
+    if (isDirectConnection())
+        serial_direct->close_jack();
+}
+
 unsigned long SerialPortActions::read_vbatt()
+
+
+
 {
     if (isDirectConnection())
     {

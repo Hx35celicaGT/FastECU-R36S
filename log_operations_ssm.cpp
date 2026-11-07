@@ -593,6 +593,147 @@ static void r36sArduinoLine(const QByteArray &raw)
     }
 }
 
+// ===== R36S: Tactrix 2.5 mm jack (channel 9) =====
+// The OpenPort's jack is a receive-only serial input. Its bytes arrive mixed into the Tactrix
+// stream; J2534::PassThruReadMsgs collects them and read_log_serial_data() hands them here.
+// Turn it on in log_setup.txt (one device on the jack at a time):
+//   lm2 = jack              Innovate LM-2 (MTS) -> Wideband Lambda / AFR / Status (LM-2)
+//   arduino_port = jack     the Nano's CSV through the jack instead of its own USB cable
+//   jack_baud = 19200       optional (MTS is always 19200)
+enum R36SJackMode { R36S_JACK_OFF, R36S_JACK_LM2, R36S_JACK_ARDUINO };
+static R36SJackMode r36sJackMode = R36S_JACK_OFF;
+static int r36sJackBaud = 19200;
+static QByteArray r36sJackBuffer;
+static QElapsedTimer r36sJackLastPacket;
+
+static int r36sJackIndex(FileActions::LogValuesStructure *lv, const QString &id)
+{
+    for (int j = lv->log_value_id.length() - 1; j >= 0; j--)
+        if (lv->log_value_id.at(j) == id && lv->log_value_protocol.at(j) == r36sArduinoProtocol)
+            return j;
+    return -1;
+}
+
+static void r36sJackAddValue(FileActions::LogValuesStructure *lv, const QString &id, const QString &name,
+                             const QString &unit, const QString &decimals)
+{
+    if (r36sJackIndex(lv, id) >= 0)
+        return;
+    lv->log_value_protocol.append(r36sArduinoProtocol);
+    lv->log_value_id.append(id);
+    lv->log_value_name.append(name);
+    lv->log_value_description.append("Innovate MTS on the Tactrix 2.5 mm jack");
+    lv->log_value_ecu_byte_index.append("ard");   // not requested from the ECU
+    lv->log_value_ecu_bit.append("0");
+    lv->log_value_target.append("1");
+    lv->log_value_enabled.append("1");
+    lv->log_value.append("--");
+    lv->log_value_address.append("ard");
+    lv->log_value_length.append("1");
+    lv->log_value_units.append("conversion 0," + unit + ",x," + decimals + ",0,0,0");
+    lv->log_value_storagetype.append("");
+    lv->log_value_endian.append("big");
+}
+
+static void r36sJackSet(FileActions::LogValuesStructure *lv, const QString &id, double v, int decimals, bool valid)
+{
+    int j = r36sJackIndex(lv, id);
+    if (j < 0)
+        return;
+    if (!valid)
+    {
+        lv->log_value.replace(j, "--");          // shown as -- and left out of min/max
+        return;
+    }
+    lv->log_value.replace(j, QString::number(v, 'f', decimals));
+    QHash<int, QPair<double, double> >::iterator mm = r36sMinMax.find(j);
+    if (mm == r36sMinMax.end())
+        r36sMinMax.insert(j, qMakePair(v, v));
+    else
+    {
+        mm.value().first = qMin(mm.value().first, v);
+        mm.value().second = qMax(mm.value().second, v);
+    }
+}
+
+// One MTS packet. The first word pair after the header is the LM-2's lambda:
+//   word 0 = 010 FFF 1 A7 / 0 A6..A0  (F = function, 0 = lambda valid, 4 = warming up; A = AFR multiplier x10)
+//   word 1 = 00 L12..L7 / 0 L6..L0    (lambda = (L + 500) / 1000)
+static void r36sLm2Packet(const QByteArray &p)
+{
+    FileActions::LogValuesStructure *lv = r36sArduinoLv;
+    if (!lv || p.length() < 6)
+        return;
+    uint8_t b2 = p.at(2), b3 = p.at(3), b4 = p.at(4), b5 = p.at(5);
+    if ((b2 & 0xE2) != 0x42)
+        return;                                  // not a lambda word pair
+    int func = (b2 >> 2) & 0x07;
+    double afrMult = (((b2 & 0x01) << 7) | (b3 & 0x7F)) / 10.0;
+    double lambda = ((((b4 & 0x3F) << 7) | (b5 & 0x7F)) + 500) / 1000.0;
+    r36sJackLastPacket.start();
+    r36sJackSet(lv, "LM2_STATUS", func, 0, true);
+    r36sJackSet(lv, "LM2_LAMBDA", lambda, 3, func == 0);
+    r36sJackSet(lv, "LM2_AFR", lambda * afrMult, 2, func == 0);
+}
+
+static void r36sJackFeed(const QByteArray &data)
+{
+    FileActions::LogValuesStructure *lv = r36sArduinoLv;
+    if (!lv)
+        return;
+    if (r36sJackMode == R36S_JACK_ARDUINO)
+    {
+        r36sArduinoBuffer.append(data);
+        int nl;
+        while ((nl = r36sArduinoBuffer.indexOf('\n')) >= 0)
+        {
+            r36sArduinoLine(r36sArduinoBuffer.left(nl));
+            r36sArduinoBuffer.remove(0, nl + 1);
+        }
+        if (r36sArduinoBuffer.size() > 4096) r36sArduinoBuffer.clear();
+        if (r36sArduinoLastLine.isValid() && r36sArduinoLastLine.elapsed() > 1500)
+            for (const QString &c : r36sArduinoColumns)
+            {
+                int j = r36sArduinoIndex(lv, c);
+                if (j >= 0) lv->log_value.replace(j, "--");
+            }
+        return;
+    }
+    r36sJackBuffer.append(data);
+    while (r36sJackBuffer.size() >= 2)
+    {
+        // MTS header word: bits 15, 13, 9 and 7 set; length in words = bit 8 + bits 6..0
+        int i = 0;
+        while (i + 1 < r36sJackBuffer.size() &&
+               !(((uint8_t)r36sJackBuffer.at(i) & 0xA2) == 0xA2 && ((uint8_t)r36sJackBuffer.at(i + 1) & 0x80) == 0x80))
+            i++;
+        if (i)
+            r36sJackBuffer.remove(0, i);
+        if (r36sJackBuffer.size() < 2)
+            break;
+        int words = (((uint8_t)r36sJackBuffer.at(0) & 0x01) << 7) | ((uint8_t)r36sJackBuffer.at(1) & 0x7F);
+        int need = 2 + 2 * words;
+        if (r36sJackBuffer.size() < need)
+            break;
+        r36sLm2Packet(r36sJackBuffer.left(need));
+        r36sJackBuffer.remove(0, need);
+    }
+    if (r36sJackBuffer.size() > 4096) r36sJackBuffer.clear();
+    if (r36sJackLastPacket.isValid() && r36sJackLastPacket.elapsed() > 1500)
+        for (const char *id : { "LM2_LAMBDA", "LM2_AFR", "LM2_STATUS" })
+            r36sJackSet(lv, id, 0, 0, false);    // LM-2 stopped sending
+}
+
+// Called by MainWindow::read_log_serial_data() after each Tactrix read
+void r36sJackPoll(SerialPortActions *serial)
+{
+    if (r36sJackMode == R36S_JACK_OFF || !serial || !serial->get_use_openport2_adapter())
+        return;
+    r36sJackFeed(serial->take_jack_data(r36sJackBaud));
+}
+
+
+
 // ---- FTDI direct: talk to the Nano's FT232R chip over USB (no kernel driver needed) ----
 // Uses Linux usbfs (/dev/bus/usb/BBB/DDD). A reader thread collects the bytes; the
 // FastECU timer hands them to r36sArduinoLine on the main thread.
@@ -856,6 +997,8 @@ static QString r36sArduinoFindPort(const QString &setting)
 QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString &protocol)
 {
     QString portSetting, baud = "115200";
+    QString lm2Setting;                          // R36S: jack
+    r36sJackBaud = 19200;
     QString channelsPath = QDir(R36S_FILES_DIR).filePath("arduino_channels.txt");
     r36sArduinoUnits.clear();
     QFile f(QDir(R36S_FILES_DIR).filePath("log_setup.txt"));
@@ -872,6 +1015,8 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
             QString val = line.mid(eq + 1).trimmed();
             if (kind == "arduino_port") portSetting = val;
             else if (kind == "arduino_baud") baud = val;
+                        else if (kind == "lm2") lm2Setting = val.toLower();                          // R36S: jack
+            else if (kind == "jack_baud") r36sJackBaud = val.toInt() > 0 ? val.toInt() : 19200;
             else if (kind == "arduino_channels")
                 channelsPath = QDir::isAbsolutePath(val) ? val : QDir(R36S_FILES_DIR).filePath(val);
             else if (kind == "arduino_units")
@@ -882,11 +1027,30 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
                 }
         }
     }
+
+    // R36S: Tactrix 2.5 mm jack
+    QStringList jackNotes;
+    r36sJackMode = R36S_JACK_OFF;
+    r36sJackBuffer.clear();
+    if (portSetting.toLower() == "jack")
+        r36sJackMode = R36S_JACK_ARDUINO;
+    else if (lm2Setting == "jack")
+    {
+        r36sJackMode = R36S_JACK_LM2;
+        r36sArduinoLv = lv;
+        r36sArduinoProtocol = protocol;
+        r36sJackAddValue(lv, "LM2_LAMBDA", "Wideband Lambda (LM-2)", "lambda", "0.000");
+        r36sJackAddValue(lv, "LM2_AFR", "Wideband AFR (LM-2)", "AFR", "0.00");
+        r36sJackAddValue(lv, "LM2_STATUS", "Wideband Status (LM-2)", "code", "0");
+        jackNotes << "LM-2: reading the Tactrix 2.5 mm jack at " + QString::number(r36sJackBaud) + " (status 0 = ok, 4 = warming up)";
+    }
+
+
     if (portSetting.isEmpty())
     {
         if (r36sArduinoPort) { r36sArduinoPort->close(); }
         r36sFtdiStop();
-        return QStringList() << "Arduino: off (add  arduino_port = auto  to log_setup.txt to use it)";
+        return jackNotes << "Arduino: off (add  arduino_port = auto  to log_setup.txt to use it)";
     }
 
     r36sArduinoLv = lv;
@@ -896,6 +1060,16 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
         for (const R36SArduinoColumn &c : R36S_ARDUINO_COLUMNS) r36sArduinoAddColumn(lv, c.col);
     for (const QString &c : r36sArduinoChannelOrder) r36sArduinoAddColumn(lv, c);
     for (const QString &c : r36sArduinoColumns) r36sArduinoAddColumn(lv, c);
+
+    if (r36sJackMode == R36S_JACK_ARDUINO)       // R36S: the Nano's CSV comes through the Tactrix jack
+    {
+        if (r36sArduinoPort) { r36sArduinoPort->close(); }
+        r36sFtdiStop();
+        r36sArduinoColumns.clear();
+        r36sArduinoBuffer.clear();
+        return QStringList() << "Arduino: reading the Tactrix 2.5 mm jack at " + QString::number(r36sJackBaud);
+    }
+
 
     if (!r36sArduinoPort)
     {
@@ -2437,6 +2611,9 @@ void MainWindow::read_log_serial_data()
         {
             //emit LOG_D("Log params get failed:" << parse_message_to_hex(received), true, true);
         }
+
+                if (logging_state)
+            r36sJackPoll(serial);   // R36S: 2.5 mm jack bytes came in with the same Tactrix read (only while logging)
 
         logparams_read_active = false;
     }

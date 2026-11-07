@@ -1112,6 +1112,48 @@ int SerialPortActionsDirect::set_j2534_ioctl(unsigned long parameter, int value)
     return STATUS_SUCCESS;
 }
 
+// R36S: Tactrix 2.5 mm jack (channel 9), opened next to the K-line channel on first use
+QByteArray SerialPortActionsDirect::take_jack_data(int baud)
+{
+#if defined Q_OS_UNIX
+    if (!use_openport2_adapter || !j2534->is_serial_port_open())
+        return QByteArray();
+    if (!j2534->jack_open)
+    {
+        unsigned long jackChan = 9;
+        // ISO9141_NO_CHECKSUM, or the adapter drops the last byte of every message as a checksum
+        if (j2534->PassThruConnect(devID, 9, ISO9141_NO_CHECKSUM, baud, &jackChan))
+            return QByteArray();
+        PASSTHRU_MSG mask, pattern;
+        memset(&mask, 0, sizeof(mask));
+        mask.ProtocolID = 9;
+        mask.DataSize = 4;                 // pass-all filter: 4-byte mask and pattern of zeros
+        pattern = mask;
+        unsigned long filterId = 0;
+        j2534->PassThruStartMsgFilter(9, PASS_FILTER, &mask, &pattern, NULL, &filterId);
+        j2534->jack_open = true;
+        emit LOG_I("Tactrix 2.5 mm jack opened at " + QString::number(baud) + " baud", true, true);
+    }
+    return j2534->take_jack_data();
+#else
+    Q_UNUSED(baud);
+    return QByteArray();
+#endif
+}
+
+// R36S: close the 2.5 mm jack channel (Logging off)
+void SerialPortActionsDirect::close_jack()
+{
+#if defined Q_OS_UNIX
+    if (use_openport2_adapter && j2534->jack_open && j2534->is_serial_port_open())
+    {
+        j2534->close_jack();
+        emit LOG_I("Tactrix 2.5 mm jack closed", true, true);
+    }
+#endif
+}
+
+
 unsigned long SerialPortActionsDirect::read_vbatt()
 {
     if (use_openport2_adapter)

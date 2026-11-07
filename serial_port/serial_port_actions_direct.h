@@ -147,6 +147,8 @@ public:
     QString open_serial_port();
 
     unsigned long read_vbatt();
+    QByteArray take_jack_data(int baud);   // R36S: Tactrix 2.5 mm jack bytes (opens the jack on first use)
+    void close_jack();                     // R36S: close the jack channel (Logging off)    
     int set_j2534_ioctl(unsigned long parameter, int value);
 
     bool get_is_tx_done();
@@ -156,7 +158,7 @@ private:
 #define ARRAYSIZE(A) (sizeof(A)/sizeof((A)[0]))
 #endif
 
-//    QByteArray transferred_rom;  // Переменная для хранения переданного ROM// ...
+//    QByteArray transferred_rom;  // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ ROM// ...
     long PassThruOpen(const void *pName, unsigned long *pDeviceID);
     long PassThruClose(unsigned long DeviceID);
     long PassThruConnect(unsigned long DeviceID, unsigned long ProtocolID, unsigned long Flags, unsigned long Baudrate, unsigned long *pChannelID);

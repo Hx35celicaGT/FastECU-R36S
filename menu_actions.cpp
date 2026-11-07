@@ -963,6 +963,7 @@ void MainWindow::toggle_realtime()
         log_ssm_values();
         delay(200);
         logparams_poll_timer->stop();
+        serial->close_jack();   // R36S: stop the 2.5 mm jack so its data doesn't pile up while not logging        
         r36sShowLogPanel(ui->logBoxWidget, false);  // R36S: hide the digital panel
         r36sSetMenuChecked(ui->menubar, "Log to file", false);   // R36S: CSV ends with Logging
         write_datalog_to_file = false;

@@ -168,6 +168,9 @@ public:
 
     unsigned long read_vbatt();
 
+    QByteArray take_jack_data(int baud);   // R36S: Tactrix 2.5 mm jack bytes (direct connection only)
+    void close_jack();                     // R36S: close the jack channel (Logging off)    
+
 public slots:
     void websocket_connected(void);
     void waitForSource(void);
