@@ -26,6 +26,7 @@ QString J2534::open_serial_port(QString serial_port)
                 //serial->setRequestToSend(setRequestToSend);
                 serial->clearError();
                 serial->clear();
+                rx_buf.clear();
                 serial->flush();
                 opened_serial_port = serial_port;
                 //connect(serial, SIGNAL(readyRead()), this, SLOT(ReadSerialDataSlot()), Qt::DirectConnection);
@@ -60,6 +61,7 @@ void J2534::close_serial_port()
     }
     jack_open = false;   // R36S: the jack channel closes with the port
     jack_rx.clear();
+    rx_buf.clear();
     opened_serial_port = "";
 }
 
@@ -71,23 +73,28 @@ bool J2534::is_serial_port_open()
 QByteArray J2534::read_serial_data(uint32_t datalen, uint16_t timeout)
 {
     QByteArray ReceivedData;
-    QByteArray PayloadData;
-
-    ReceivedData.clear();
 
     if (serial->isOpen())
     {
-        QTime dieTime = QTime::currentTime().addMSecs(timeout);
-        while ((uint32_t)ReceivedData.length() < datalen && (QTime::currentTime() < dieTime))
+        // R36S: take everything waiting on the port in one go and keep the extra in rx_buf,
+        // instead of one byte plus a full event-loop pass at a time. Byte by byte, the R36S
+        // could not keep up with the ECU + jack stream and logging fell further behind.
+        QElapsedTimer quiet;
+        quiet.start();
+        while ((uint32_t)rx_buf.length() < datalen)
         {
             if (serial->bytesAvailable())
             {
-                dieTime = QTime::currentTime().addMSecs(timeout);
-                ReceivedData.append(serial->read(1));
+                rx_buf.append(serial->readAll());
+                quiet.restart();
+                continue;
             }
+            if (quiet.elapsed() >= timeout)
+                break;
             QCoreApplication::processEvents(QEventLoop::AllEvents, 1);
         }
-        //emit LOG_D("Read J2534 msg:" << parseMessageToHex(ReceivedData);
+        ReceivedData = rx_buf.left(datalen);
+        rx_buf.remove(0, ReceivedData.length());
     }
 
     return ReceivedData;
@@ -177,6 +184,7 @@ void J2534::close_jack()
     serial->clear(QSerialPort::Input);
     jack_open = false;
     jack_rx.clear();
+    rx_buf.clear();
 }
 
 
@@ -1121,7 +1129,7 @@ long J2534::PassThruIoctl(unsigned long ChannelID, unsigned long IoctlID, const 
         output.clear();
         QString str = "atr " + QString::number((int)pin) + "\r\n";
         output.append(str.toUtf8());
-        if (serial->bytesAvailable())
+        if (serial->bytesAvailable() || !rx_buf.isEmpty())
             return result;
         write_serial_data(output);
         emit LOG_D("Sent: " + parseMessageToHex(output), true, true);

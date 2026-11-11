@@ -91,6 +91,7 @@ private:
     bool msg_ack = false;
     bool is_tx_done = false;
     QByteArray jack_rx;           // R36S: jack bytes not yet taken
+    QByteArray rx_buf;            // R36S: bytes read from the port but not handed out yet    
     bool r36s_read_line(QByteArray &buf, uint8_t end, int max, unsigned long timeout);    
 
     enum rx_msg_type {
