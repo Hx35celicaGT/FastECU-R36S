@@ -1,0 +1,11 @@
+{
+ "tool": "ram_sniffer",
+ "kind": "fill",
+ "ecu_id": "4E12087007",
+ "start": 16732336,
+ "end": 16735195,
+ "pattern": "A5",
+ "time": "2026-11-09 10:54:27",
+ "backup": "ramsniff/fills/20261109-105401_backup_0xFFFF50B0_0xFFFF5BDB.bin",
+ "readback_bad": []
+}

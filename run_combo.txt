@@ -1,0 +1,30 @@
+> ati                                < b'ari main code version : 1.17.4877\r\n'
+> ata                                < b'aro\r\n'
+> ato3 512 4800 3                    < b'aro\r\n'
+> ats3 3 0                           < b'aro\r\n'
+> ats3 7 1                           < b'aro\r\n'
+> ats3 10 0                          < b'aro\r\n'
+> ats3 12 0                          < b'aro\r\n'
+> ats3 22 0                          < b'aro\r\n'
+> ats3 20 25                         < b'aro\r\n'
+> atf3 1 0 4                         < b'arf3 0 0\r\n'
+> ato9 512 19200 0                   < b'aro\r\n'
+> atf9 1 0 4                         < b'arf9 1 0\r\nar9\x05\x80\x02\xb2_@ar9\x13\x00\xb2\x88S\x13\x03\x0b\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00ar9\x05@\x02\xb2\xd3\xddar9\x05\x80\x02\xb3\x9f\x95ar9\x13\x00\xb2\x88S\x13\x02h\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00ar9\x05@\x02\xb4\x148'
+
+Polling RPM every 50 ms and reading the jack for 60 s ...
+
+    5s  SSM  16.2/s (sent  16.4/s)  RPM 1043.25  |  jack  12.2 pkt/s    219 B/s  warming up (590)  |  resync 0
+   10s  SSM  16.3/s (sent  16.3/s)  RPM 1032.75  |  jack  12.4 pkt/s    222 B/s  warming up (785)  |  resync 0
+   15s  SSM  16.4/s (sent  16.4/s)  RPM  1018.0  |  jack  12.2 pkt/s    219 B/s  warming up (815)  |  resync 0
+   20s  SSM  16.4/s (sent  16.4/s)  RPM  994.25  |  jack  12.2 pkt/s    219 B/s  warming up (815)  |  resync 0
+   25s  SSM  16.4/s (sent  16.4/s)  RPM  999.75  |  jack  12.2 pkt/s    219 B/s  lambda 1.047  AFR 15.39  |  resync 0
+   30s  SSM  16.4/s (sent  16.4/s)  RPM  1015.5  |  jack  12.2 pkt/s    219 B/s  lambda 1.030  AFR 15.14  |  resync 0
+   35s  SSM  16.4/s (sent  16.4/s)  RPM 1007.75  |  jack  12.2 pkt/s    219 B/s  lambda 1.068  AFR 15.70  |  resync 0
+   40s  SSM  16.4/s (sent  16.4/s)  RPM  997.25  |  jack  12.2 pkt/s    219 B/s  lambda 1.027  AFR 15.10  |  resync 0
+   45s  SSM  16.5/s (sent  16.3/s)  RPM  987.25  |  jack  12.2 pkt/s    219 B/s  lambda 1.211  AFR 17.80  |  resync 0
+   50s  SSM  16.4/s (sent  16.4/s)  RPM   983.5  |  jack  12.2 pkt/s    219 B/s  lambda 1.098  AFR 16.14  |  resync 0
+   55s  SSM  16.4/s (sent  16.4/s)  RPM   996.5  |  jack  12.2 pkt/s    219 B/s  lambda 1.071  AFR 15.74  |  resync 0
+
+Totals in 60 s: SSM sent 982, replies 982 (100%), jack frames 2196, MTS packets 732, resyncs 0
+Jack data-frame sizes (bytes: count): {18: 732}
+> atz                                < b'aro\r\n'

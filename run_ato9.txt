@@ -1,0 +1,11 @@
+> ati                            < b'ari main code version : 1.17.4877\r\n'
+> ata                            < b'aro\r\n'
+> ato9 0 19200 0                 < b'aro\r\n'
+
+Listening 60 s ... (Ctrl+C to stop)
+
+
+
+0 bytes in 60.1 s = 0 bytes/s, 0 'ar9' headers
+Raw bytes saved to jack_test_raw.bin
+> atz                            < b'aro\r\n'

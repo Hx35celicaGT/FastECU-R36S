@@ -1,0 +1,8 @@
+ram_sniffer 1.2 check 'idle'  ECU 4E12087007  28 passes  609 s  pattern A5
+
+0xFFFF50B0-0xFFFF5BDB  2860 bytes  overwritten 0
+  intact  0xFFFF50B0-0xFFFF5BDB  2860 bytes
+0xFFFFA490-0xFFFFB4DF  4176 bytes  overwritten 0
+  intact  0xFFFFA490-0xFFFFB4DF  4176 bytes
+
+If a whole block reads 00 right after a key cycle, boot clears it (CAND2 is expected to).
