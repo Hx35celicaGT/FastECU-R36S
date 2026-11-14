@@ -3347,6 +3347,9 @@ static QStringList r36sCsvDisplayNames()
 
 // The 6 line colours offered in the picker (all readable on FastECU's light background)
 static const int R36S_CSV_COLORS = 6;
+// R36S: dotted line steps, as a part of the window. D-pad = window / 100, FN + D-pad = window / 10.
+static const int R36S_CSV_STEP_DIV = 100;
+static const int R36S_CSV_FAST_DIV = 10;
 static QColor r36sCsvColor(int c)
 {
     static const char *col[R36S_CSV_COLORS] = { "#1f6fd1", "#d1495b", "#2a9d4b", "#e07b00", "#7b4fc9", "#0f8b8d" };
@@ -3359,10 +3362,29 @@ class R36SPaintBox : public QWidget
 public:
     std::function<void(QPainter &, const QRect &)> onPaint;
     std::function<void(const QPoint &)> onClick;
+    std::function<void(const QPoint &, int)> onWheel;   // R36S: whole wheel notches, + = away from you
     explicit R36SPaintBox(QWidget *parent) : QWidget(parent) { setFocusPolicy(Qt::NoFocus); }
 protected:
     void paintEvent(QPaintEvent *) override { QPainter p(this); if (onPaint) onPaint(p, rect()); }
     void mousePressEvent(QMouseEvent *e) override { if (e->button() == Qt::LeftButton && onClick) onClick(e->pos()); }
+    void wheelEvent(QWheelEvent *e) override
+    {
+        if (!onWheel)
+            return QWidget::wheelEvent(e);
+        wheelRest += e->angleDelta().y();
+        int notches = wheelRest / 120;          // one notch = 120 (a mouse wheel; the R36S right stick sends the same)
+        wheelRest -= notches * 120;
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+        QPoint at = e->position().toPoint();
+#else
+        QPoint at = e->pos();
+#endif
+        if (notches)
+            onWheel(at, notches);
+        e->accept();
+    }
+private:
+    int wheelRest = 0;
 };
 
 class R36SCsvViewer : public QWidget
@@ -3380,6 +3402,7 @@ public:
         layout->addWidget(top);
         split = new QSplitter(Qt::Horizontal, this);
         split->setHandleWidth(10);              // wide enough to grab with the stick cursor
+        split->setStyleSheet("QSplitter::handle { background: #e3e3e3; }");   // R36S: plain light-grey bar on every system        
         split->setChildrenCollapsible(false);
         list = new R36SPaintBox(split);
         graphs = new R36SPaintBox(split);
@@ -3396,10 +3419,24 @@ public:
         list->onPaint = [this](QPainter &p, const QRect &r) { paintList(p, r); };
         graphs->onPaint = [this](QPainter &p, const QRect &r) { paintGraphs(p, r); };
         overlay->onPaint = [this](QPainter &p, const QRect &r) { paintOverlay(p, r); };
-        // A (left click) acts on what the D-pad highlighted, wherever the stick cursor happens to be
-        list->onClick = [this](const QPoint &) { openPicker(); };
-        graphs->onClick = [this](const QPoint &) { openPicker(); };
-        overlay->onClick = [this](const QPoint &) { activateOverlay(); };
+        // R36S: A / left click acts where the pointer is (a hidden pointer never clicks, see R36SPointerHider):
+        //   on a value in the list: highlight it and open its graph setup (same as Y on the highlight)
+        //   on the graphs: move the dotted line there (saved logs; live has no dotted line)
+        //   in graph setup / the log list: pick the option under the pointer
+        list->onClick = [this](const QPoint &at) { clickList(at); };
+        graphs->onClick = [this](const QPoint &at) { clickGraphs(at); };
+        overlay->onClick = [this](const QPoint &at) { clickOverlay(at); };
+        // Wheel (R36S right stick): zoom over the graphs, move the highlight over the list
+        graphs->onWheel = [this](const QPoint &, int notches) {
+            if (pickMode) return;
+            zoom(notches > 0 ? 1.0 / 1.5 : 1.5);
+            updateAll();
+        };
+        list->onWheel = [this](const QPoint &, int notches) {
+            if (pickMode || data().names.isEmpty()) return;
+            sel = qBound(0, sel - notches, data().names.size() - 1);
+            updateAll();
+        };
 
         statusTimer = new QTimer(this);
         statusTimer->setInterval(1000);
@@ -3420,6 +3457,9 @@ public:
         applyAssignments();
         updateAll();
     }
+
+    // File > Open log: the same newest-first list that Select opens
+    void showLogList() { openLogList(); }    
 
     // A live row arrived (called from r36sCsvLiveRow)
     void liveRowAdded(int dropped)
@@ -3517,15 +3557,17 @@ protected:
             updateAll();
             return;
         }
+        // R36S: left / right move the dotted line at one steady speed (no speed-up when held).
+        // FN + D-pad left / right (F7 / F8) or Shift + arrows on a PC: fast steps.
+        // On this desktop F7 / F8 are not the "send axis to 2D graph" keys (those belong to the FastECU window).
+        const bool fastLeft  = key == Qt::Key_F7 || (key == Qt::Key_Left  && (e->modifiers() & Qt::ShiftModifier));
+        const bool fastRight = key == Qt::Key_F8 || (key == Qt::Key_Right && (e->modifiers() & Qt::ShiftModifier));
         if (key == Qt::Key_Up)                    sel = qMax(0, sel - 1);
         else if (key == Qt::Key_Down)             sel = qMin(n - 1, sel + 1);
-        else if (key == Qt::Key_Left || key == Qt::Key_Right)
+        else if (fastLeft || fastRight || key == Qt::Key_Left || key == Qt::Key_Right)
         {
-            repeats = e->isAutoRepeat() ? repeats + 1 : 0;
-            int step = qMax(1, win / (repeats > 8 ? 20 : 100));
-            pos += key == Qt::Key_Left ? -step : step;
-            clampPos();
-            follow = usingLive && pos >= data().rows() - 1;
+            int step = qMax(1, win / ((fastLeft || fastRight) ? R36S_CSV_FAST_DIV : R36S_CSV_STEP_DIV));
+            moveMarker((fastLeft || key == Qt::Key_Left) ? -step : step);
         }
         else if (enter)                           openPicker();
         else if (key == Qt::Key_Space)            openLogList();
@@ -3545,7 +3587,9 @@ private:
     bool follow = false;         // live: keep the newest row on the marker
     bool repaintPending = false;
     QString lastNewest;
-    int sel = 0, pos = 0, win = 600, listTop = 0, repeats = 0;
+    int sel = 0, pos = 0, win = 600, listTop = 0;
+    int viewStart = 0;           // saved log: first row at the left edge (the dotted line is pos, anywhere in the window)
+    int plotLeft = 0, plotWidth = 0;   // where the graphs were drawn last (for clicks)
     QVector<int> graph;          // per column: 0 = not shown, 1-4 = graph
     QVector<char> side;          // per column: 'A' or 'B'
     QVector<int> color;          // per column: 0-5, see r36sCsvColor
@@ -3571,11 +3615,45 @@ private:
     void zoom(double f)
     {
         int rows = data().rows();
+        int oldWin = win;
         win = qBound(20, int(win * f + 0.5), usingLive ? 6000 : qMax(40, rows * 2));
         if (usingLive)
             r36sCsvLiveKeep = win;
         if (follow)
             pos = rows - 1;
+        if (!usingLive)
+        {
+            // keep the dotted line at the same place on the screen
+            double at = oldWin > 0 ? double(pos - viewStart) / oldWin : 0.5;
+            viewStart = pos - int(at * win + 0.5);
+            clampView();
+        }
+    }
+
+    // Saved log: the window never runs past the ends of the log (unless the log is shorter than the window)
+    void clampView()
+    {
+        int rows = data().rows();
+        viewStart = qBound(0, viewStart, qMax(0, rows - win));
+    }
+
+    // Saved log: scroll only when the dotted line reaches an edge
+    void keepMarkerVisible()
+    {
+        if (pos < viewStart)
+            viewStart = pos;
+        else if (pos > viewStart + win)
+            viewStart = pos - win;
+        clampView();
+    }
+
+    void moveMarker(int step)
+    {
+        pos += step;
+        clampPos();
+        follow = usingLive && pos >= data().rows() - 1;
+        if (!usingLive)
+            keepMarkerVisible();
     }
 
     void refresh()
@@ -3617,6 +3695,7 @@ private:
         int rows = file.rows();
         win = qMax(20, rows);        // whole log on screen first
         pos = rows / 2;
+        viewStart = 0;        
         applyAssignments();
     }
 
@@ -3811,22 +3890,34 @@ private:
             p.drawText(r, Qt::AlignCenter, d.names.isEmpty() ? "No log loaded" : "Waiting for data");
             return;
         }
-        int G = 1;
-        for (int g : graph)
-            G = qMax(G, g);
+         // R36S: only the graphs that have a value on them share the height (an empty Graph 2 takes no room)
+        QList<int> used;
+        for (int g = 1; g <= 4; g++)
+            if (graph.contains(g))
+                used << g;
         const int L = sfm.horizontalAdvance("-00000") + 6, R = L, hh = sfm.height() + 4;
-        // Live: the newest row (pos) is on the right edge, so the window fills the whole graph.
-        // A saved log: pos is on the centre marker, so you can move the pointer through it.
-        const bool liveEdge = usingLive;
-        const int rows = d.rows(), a = liveEdge ? pos - win : pos - win / 2;
-        const int gh = r.height() / G;
-        for (int g = 1; g <= G; g++)
+        plotLeft = r.x() + L;
+        plotWidth = r.width() - L - R;
+        if (used.isEmpty())
         {
-            int y0 = r.y() + (g - 1) * gh;
-            QRect box(r.x(), y0, r.width(), g == G ? r.bottom() - y0 + 1 : gh);
+            p.setPen(palette().text().color());
+            p.drawText(r, Qt::AlignCenter, "No values on the graphs\nY or A on a value to add one");
+            return;
+        }
+        // Live: the newest row (pos) is on the right edge, so the window fills the whole graph.
+        // A saved log: the window starts at viewStart and the dotted line (pos) can be anywhere in it.
+        const bool liveEdge = usingLive;
+        const int rows = d.rows(), a = liveEdge ? pos - win : viewStart;
+        const int G = used.size();
+        const int gh = r.height() / G;
+        for (int gi = 0; gi < G; gi++)
+        {
+            const int g = used.at(gi);
+            int y0 = r.y() + gi * gh;
+            QRect box(r.x(), y0, r.width(), gi == G - 1 ? r.bottom() - y0 + 1 : gh);
             QRect head(box.x(), box.y(), box.width(), hh);
             QRect plot(box.x() + L, box.y() + hh + 2, box.width() - L - R, box.height() - hh - 6);
-            if (g > 1)
+            if (gi > 0)
             {
                 p.setPen(palette().mid().color());
                 p.drawLine(box.left(), box.top(), box.right(), box.top());
@@ -3933,11 +4024,13 @@ private:
                 p.setClipping(false);
             }
         }
-        // centre marker (saved logs only): the values in the list and the headers are read here.
-        // Live has no marker; the values shown are the newest row, at the right edge.
-        if (!liveEdge)
+        // dotted line (saved logs only): the values in the list and the headers are read here.
+        // Drawn with the same x formula as the data lines, so it sits on the row at any zoom.
+        // Live has no dotted line; the values shown are the newest row, at the right edge.
+        if (!liveEdge && plotWidth > 10)
         {
-            int mx = r.x() + L + (r.width() - L - R) / 2;
+            const double xs = double(plotWidth - 1) / win;
+            int mx = int(plotLeft + (pos - a) * xs + 0.5);
             QPen dash(palette().text().color(), 1, Qt::DashLine);
             p.setPen(dash);
             p.drawLine(mx, r.top(), mx, r.bottom());
@@ -4005,6 +4098,7 @@ private:
             {
                 QRect sw(bx + c * bw, line.y() + 3, bw - 4, lh - 6);
                 p.fillRect(sw, r36sCsvColor(c));
+                hits << qMakePair(sw, 30 + c);   // R36S: click a colour to pick it
                 if (pickColor == c)   // chosen: thick outline in the text colour
                 {
                     p.setPen(QPen(palette().text().color(), 3));
@@ -4022,7 +4116,7 @@ private:
             hint.setPointSizeF(qMax(6.0, hint.pointSizeF() - 2));
             p.setFont(hint);
             p.setPen(palette().dark().color());
-            p.drawText(line, Qt::AlignVCenter | Qt::AlignLeft, "Up/down: row   Left/right: choose   Y: accept   B: cancel");
+            p.drawText(line, Qt::AlignVCenter | Qt::AlignLeft, "Up/down: row   Left/right: choose   A: pick   Y: accept   B: cancel");
             p.setFont(font());
         }
         else if (pickMode == 2)
@@ -4056,11 +4150,60 @@ private:
             }
             p.setPen(palette().dark().color());
             p.drawText(QRect(line.x(), panel.bottom() - lh, line.width(), lh), Qt::AlignVCenter | Qt::AlignLeft,
-                       "Up/down: choose   Y: open   B: close");
+                       "Up/down: choose   Y or A : open   B: close");
         }
     }
 
-    // Y (Enter) or A (click, anywhere): accept the picker, or Cancel if it is highlighted;
+    // A / click on the value list: highlight that value and open its graph setup
+    void clickList(const QPoint &at)
+    {
+        if (pickMode)
+            return;
+        int k = listTop + at.y() / qMax(1, rowHeight());
+        if (k < 0 || k >= data().names.size())
+            return;
+        sel = k;
+        openPicker();
+    }
+
+    // A / click on the graphs: move the dotted line to that row (saved logs only)
+    void clickGraphs(const QPoint &at)
+    {
+        if (pickMode || usingLive || data().rows() == 0 || plotWidth <= 10)
+            return;
+        const double xs = double(plotWidth - 1) / win;
+        int row = viewStart + int((at.x() - plotLeft) / xs + 0.5);
+        pos = qBound(qMax(0, viewStart), row, qMin(data().rows() - 1, viewStart + win));
+        updateAll();
+    }
+
+    // A / click in graph setup or the log list: pick what is under the pointer.
+    // Outside the box: nothing (B closes it).
+    void clickOverlay(const QPoint &at)
+    {
+        int id = -1;
+        for (const QPair<QRect, int> &h : hits)
+            if (h.first.contains(at))
+                id = h.second;
+        if (id < 0)
+            return;
+        if (pickMode == 1)
+        {
+            if (id >= 0 && id <= 4)        { pickGraph = id; pickRow = 0; }
+            else if (id == 10 || id == 11) { pickSide = id == 10 ? 'A' : 'B'; pickRow = 1; }
+            else if (id >= 30 && id < 30 + R36S_CSV_COLORS) { pickColor = id - 30; pickRow = 2; }
+            else if (id == 20)             applyPicker();
+            else if (id == 21)             pickMode = 0;
+        }
+        else if (pickMode == 2 && id >= 100)
+        {
+            logSel = id - 100;
+            openFromList(logSel);
+        }
+        updateAll();
+    }
+
+    // Y (Enter): accept the picker, or Cancel if it is highlighted;
     // in the log list, open the highlighted log
     void activateOverlay()
     {
@@ -4911,6 +5054,7 @@ static QWidget *r36sGraphViewCreate(QWidget *parent)
 #include <QPointer>
 #include <QStackedWidget>
 
+void r36sShowControls(QWidget *parent);   // R36S: Help > Controls (defined below)
 static const char *R36S_DESKTOP_NAMES[] = { "FastECU", "CSV viewer", "2D / 3D"};
 static const int R36S_DESKTOP_COUNT = 3;
 
@@ -4950,7 +5094,37 @@ static QWidget *r36sDesktopOverlay()
         w->setAutoFillBackground(true);   // FastECU's own colours
         QVBoxLayout *layout = new QVBoxLayout(w);
         layout->setContentsMargins(0, 0, 0, 0);
+                // R36S: same blue highlight on the PC as on the R36S (Ubuntu would use its orange accent)
+        {
+            QPalette pal = w->palette();
+            pal.setColor(QPalette::Highlight, QColor(48, 140, 198));
+            pal.setColor(QPalette::HighlightedText, Qt::white);
+            w->setPalette(pal);
+        }
         QStackedWidget *stack = new QStackedWidget(w);
+        // R36S: small menu bar like FastECU's own. File: Open log (CSV page only) / Quit, Help: Controls
+        {
+            QMenuBar *bar = new QMenuBar(w);
+            QMenu *file = bar->addMenu("File");
+            QAction *openLog = file->addAction("Open log");
+            file->addSeparator();
+            QAction *quit = file->addAction("Quit");
+            QMenu *help = bar->addMenu("Help");
+            QAction *controls = help->addAction("Controls (PC / R36S)");
+            QObject::connect(file, &QMenu::aboutToShow, file, [openLog, stack]() {
+                openLog->setVisible(stack->currentIndex() == 0);   // page 0 = CSV viewer
+            });
+            QObject::connect(openLog, &QAction::triggered, openLog, []() {
+                if (r36sCsvViewer)
+                    r36sCsvViewer->showLogList();
+            });
+            QObject::connect(quit, &QAction::triggered, quit, []() {
+                if (MainWindow *m = qobject_cast<MainWindow*>(r36sDeskMain.data()))
+                    m->r36s_safe_quit();
+            });
+            QObject::connect(controls, &QAction::triggered, controls, [w]() { r36sShowControls(w); });
+            layout->setMenuBar(bar);
+        }        
         for (int i = 1; i < R36S_DESKTOP_COUNT; i++)
         {
             QWidget *page;
@@ -5146,13 +5320,17 @@ static QString r36sControlsHtml()
             { "F9",             "FN + D-pad down",     "Copy Table (whole table with its headers)" },
             { "Click the map's top-left icon", "A on that icon", "Window menu: Copy / Paste Table, Send To graph" },
         } },
-        { "Desktop 2: CSV viewer (logs)", {
+         { "Desktop 2: CSV viewer (logs)", {
             { "Up / Down",      "D-pad up / down",     "Move through the value list" },
-            { "Left / Right",   "D-pad left / right",  "Move along the log (hold = faster)" },
-            { "Enter or click", "Y or A",              "Pick the graph, side and colour for the highlighted value" },
-            { "Space",          "Select",              "Older logs" },
-            { "+ / -",          "R2 / L2",             "Zoom in / out" },
-            { "Esc",            "B",                   "Close the picker / log list" },
+            { "Enter",          "Y",                   "Graph setup (graph, side, colour) for the highlighted value" },
+            { "Click a value",  "A on a value",        "Highlight it and open its graph setup" },
+            { "Click a graph",  "A on a graph",        "Move the dotted line there (saved logs)" },
+            { "Left / Right",   "D-pad left / right",  "Move the dotted line" },
+            { "Shift + Left / Right", "FN + D-pad left / right", "Move the dotted line fast" },
+            { "+ / -  or wheel","R2 / L2  or right stick", "Zoom in / out (the dotted line stays put)" },
+            { "Click in setup", "A in setup",          "Pick the graph / side / colour / Accept / Cancel under the pointer" },
+            { "Space",          "Select",              "Log list (also File > Open log)" },
+            { "Esc",            "B",                   "Close the setup / log list" },
         } },
         { "Desktop 3: 2D / 3D graph", {
             { "Arrows",         "D-pad",               "Move the crosshair one cell" },

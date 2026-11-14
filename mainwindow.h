@@ -119,6 +119,7 @@ public:
     ~MainWindow();
 
     void delay(int n);
+    void r36s_safe_quit();   // R36S: Logging off, CSV closed, disconnect, then quit (File > Quit on desktops 2-3)    
 
 private:
     enum {

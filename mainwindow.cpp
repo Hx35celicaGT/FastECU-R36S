@@ -2147,6 +2147,20 @@ void MainWindow::closeEvent(QCloseEvent *event)
     close_app();
 }
 
+// R36S: File > Quit on the CSV and 2D/3D desktops. Turns Logging off first (that also closes the
+// CSV and the 2.5 mm jack and hides the 6 boxes), waits for the last replies, disconnects, then quits.
+void MainWindow::r36s_safe_quit()
+{
+    if (logging_state)
+    {
+        set_realtime_state(false);
+        toggle_realtime();          // sees Logging unticked: the normal "Stop datalog" path
+    }
+    delay(300);
+    disconnect_from_ecu();
+    close_app();
+}
+
 void MainWindow::close_app()
 {
     FileActions::ConfigValuesStructure *configValues = &fileActions->ConfigValuesStruct;
