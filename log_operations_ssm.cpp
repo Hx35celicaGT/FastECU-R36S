@@ -5099,6 +5099,7 @@ static QWidget *r36sDesktopOverlay()
             QPalette pal = w->palette();
             pal.setColor(QPalette::Highlight, QColor(48, 140, 198));
             pal.setColor(QPalette::HighlightedText, Qt::white);
+            pal.setColor(QPalette::Mid, QColor(160, 160, 160));   // line between graphs, visible on every system            
             w->setPalette(pal);
         }
         QStackedWidget *stack = new QStackedWidget(w);
