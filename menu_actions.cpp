@@ -1428,7 +1428,7 @@ int MainWindow::get_map_cell_colors(FileActions::EcuCalDefStructure *ecuCalDef, 
     mapMinValue = ecuCalDef->MapCellColorMin.value(mapIndex).toFloat();
     mapMaxValue = ecuCalDef->MapCellColorMax.value(mapIndex).toFloat();
     if (mapMaxValue - mapMinValue == 0.0f)
-        mapMaxValue = mapMinValue + 1.0f;     // one value or all the same: avoid divide by zero
+        return 0xffffff;                  // one value, or all the same: plain white like a 1D table
 
     QColor color;
     float color_scale = (1 - (mapDataValue - mapMinValue) / (mapMaxValue - mapMinValue)) * scale_start;
@@ -1445,6 +1445,8 @@ int MainWindow::get_map_cell_colors(FileActions::EcuCalDefStructure *ecuCalDef, 
 
     if (color_value < 0)
         color_value = 0;
+    if (color_value > scale_start)
+        color_value = scale_start;        // value outside the map's colour range: use the end colour    
 
     color.setHsvF(color_value, 0.85, 0.85);
     color.getRgbF(&r, &g, &b);
