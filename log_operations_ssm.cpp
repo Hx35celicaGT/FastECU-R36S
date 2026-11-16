@@ -623,7 +623,7 @@ static void r36sJackAddValue(FileActions::LogValuesStructure *lv, const QString 
     lv->log_value_protocol.append(r36sArduinoProtocol);
     lv->log_value_id.append(id);
     lv->log_value_name.append(name);
-    lv->log_value_description.append("Tactrix 2.5 mm jack");
+    lv->log_value_description.append("Tactrix AUX");
     lv->log_value_ecu_byte_index.append("ard");   // not requested from the ECU
     lv->log_value_ecu_bit.append("0");
     lv->log_value_target.append("1");
@@ -1095,7 +1095,7 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
         r36sJackAddValue(lv, "LM2_LAMBDA", "Wideband Lambda (LM-2)", "lambda", "0.000");
         r36sJackAddValue(lv, "LM2_AFR", "Wideband AFR (LM-2)", "AFR", "0.00");
         r36sJackAddValue(lv, "LM2_STATUS", "Wideband Status (LM-2)", "code", "0");
-        jackNotes << "LM-2: reading the Tactrix 2.5 mm jack at " + QString::number(r36sJackBaud) + " (status 0 = ok, 4 = warming up)";
+        jackNotes << "LM-2: reading the Tactrix AUX at " + QString::number(r36sJackBaud) + " (status 0 = ok, 4 = warming up)";
     }
     else if (aemSetting == "jack")
     {
@@ -1108,7 +1108,7 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
         r36sAemLastLine.invalidate();
         r36sJackAddValue(lv, "AEM_AFR", "Wideband AFR (AEM)", "AFR", "0.00");
         r36sJackAddValue(lv, "AEM_LAMBDA", "Wideband Lambda (AEM)", "lambda", "0.000");
-        jackNotes << "AEM: reading the Tactrix 2.5 mm jack at " + QString::number(r36sJackBaud);
+        jackNotes << "AEM: reading the Tactrix AUX at " + QString::number(r36sJackBaud);
     }
 
     if (portSetting.isEmpty())
@@ -1132,7 +1132,7 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
         r36sFtdiStop();
         r36sArduinoColumns.clear();
         r36sArduinoBuffer.clear();
-        return QStringList() << "Arduino: reading the Tactrix 2.5 mm jack at " + QString::number(r36sJackBaud);
+        return QStringList() << "Arduino: reading the Tactrix AUX at " + QString::number(r36sJackBaud);
     }
 
 
@@ -1177,6 +1177,7 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
         r36sArduinoColumns.clear();
         r36sArduinoBuffer.clear();
         if (r36sFtdiStart(baud.toInt() > 0 ? baud.toInt() : 115200, status))
+            return QStringList() << (status.isEmpty() ? "Arduino: reading " + r36sFtdiName + " directly at " + baud : status);
         return QStringList() << "Arduino: no USB serial port, FTDI or CH340 chip found besides the OBD cable (" + r36sArduinoEcuPort + ")";
     }
     r36sArduinoPort->setPortName(port);
@@ -2745,7 +2746,7 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
     QComboBox *jackCombo = new QComboBox;        // device on the Tactrix AUX
     jackCombo->addItem("Off", "off");
     jackCombo->addItem("Arduino Nano (CSV, 115200)", "arduino");
-    jackCombo->addItem("AEM UEGO X-Series (text, 9600)", "aem");
+    jackCombo->addItem("AEM UEGO (text, 9600)", "aem");
     jackCombo->addItem("Innovate LM-2 / MTX (MTS, 19200)", "lm2");
     jackCombo->setCurrentIndex(qMax(0, jackCombo->findData(extStart.jack)));
     extForm->addRow("USB:", usbCombo);

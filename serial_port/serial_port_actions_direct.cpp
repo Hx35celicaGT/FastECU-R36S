@@ -1132,7 +1132,7 @@ QByteArray SerialPortActionsDirect::take_jack_data(int baud)
         unsigned long filterId = 0;
         j2534->PassThruStartMsgFilter(9, PASS_FILTER, &mask, &pattern, NULL, &filterId);
         j2534->jack_open = true;
-        emit LOG_I("Tactrix 2.5 mm jack opened at " + QString::number(baud) + " baud", true, true);
+        emit LOG_I("Tactrix AUX opened at " + QString::number(baud) + " baud", true, true);
     }
     return j2534->take_jack_data();
 #else
@@ -1148,7 +1148,7 @@ void SerialPortActionsDirect::close_jack()
     if (use_openport2_adapter && j2534->jack_open && j2534->is_serial_port_open())
     {
         j2534->close_jack();
-        emit LOG_I("Tactrix 2.5 mm jack closed", true, true);
+        emit LOG_I("Tactrix AUX closed", true, true);
     }
 #endif
 }
