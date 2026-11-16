@@ -145,6 +145,15 @@ CalibrationMaps::CalibrationMaps(FileActions::EcuCalDefStructure *ecuCalDef, int
             ui->mapDataTableWidget->verticalHeader()->resizeSection(row, mapCellHeight);
     }
 */
+    // One-value 2D tables with a static axis get a label row on top with no text in the
+    // definition, so FastECU shows "0". Hide it: the row stays, so cell positions don't change.
+    if (ecuCalDef->TypeList.at(mapIndex) == "2D" && ecuCalDef->XSizeList.at(mapIndex).toInt() <= 1
+        && ecuCalDef->YSizeList.at(mapIndex).toInt() <= 1 && ySize > 1)
+    {
+        ui->mapDataTableWidget->setRowHidden(0, true);
+        ui->mapDataTableWidget->setCurrentCell(1, 0);       // start on the value, not the hidden row
+    }
+
     setMapTableWidgetSize(mdiAreaSize.width()-15, mdiAreaSize.height()-15, xSize);
 
     if (ecuCalDef->TypeList.at(mapIndex) != "Selectable" && ecuCalDef->TypeList.at(mapIndex) != "Switch")

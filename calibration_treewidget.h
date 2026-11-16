@@ -6,6 +6,8 @@
 #include <QTreeWidget>
 #include <QLabel>
 #include <QPushButton>
+#include <QSet>
+#include <QHash>
 
 #include <file_actions.h>
 
@@ -69,7 +71,8 @@ signals:
     void closeRom();
 
 private:
-
+    QSet<QString> openFolders;   // R36S: folders (e.g. "Vmod") left open, kept while FastECU runs
+ 
 private slots:
 
 };

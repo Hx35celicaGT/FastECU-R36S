@@ -48,7 +48,6 @@ QTreeWidget *CalibrationTreeWidget::buildCalibrationFilesTree(int ecuCalDefIndex
 
 QTreeWidget *CalibrationTreeWidget::buildCalibrationDataTree(QTreeWidget *dataTreeWidget, FileActions::EcuCalDefStructure *ecuCalDef)
 {
-    bool treeCategoryCreated = false;
 
     /**************************
      * Create data tree
@@ -83,53 +82,78 @@ QTreeWidget *CalibrationTreeWidget::buildCalibrationDataTree(QTreeWidget *dataTr
         }
     }
 
-    for (int j = 0; j < ecuCalDef->NameList.count(); j++)
+    // R36S: categories named "Group - Name" go into a folder "Group" when two or more of them share
+    // that group (Vmod - Knock, Vmod - VE ... -> Vmod > Knock, VE). A group used by only one category,
+    // and names without " - ", stay on the top level as before. Each category keeps its full name in
+    // UserRole, so its open / closed state is still saved under the definition's category name.
+    QHash<QString, int> groupCount;
+    QSet<QString> seenCats;
+    for (int j = 0; j < ecuCalDef->NameList.count() && j < ecuCalDef->CategoryList.count(); j++)
     {
-        //emit LOG_D("Check map: " + ecuCalDef->NameList[j] + " in category: " + ecuCalDef->CategoryList[j], true, true);
-        if (ecuCalDef->CategoryList[j] != "" && ecuCalDef->CategoryList[j] != " ")
+        const QString cat = ecuCalDef->CategoryList.at(j);
+        if (cat.trimmed().isEmpty() || ecuCalDef->NameList.at(j).trimmed().isEmpty() || seenCats.contains(cat))
+            continue;
+        seenCats.insert(cat);
+        int dash = cat.indexOf(" - ");
+        if (dash > 0)
+            groupCount[cat.left(dash).trimmed()]++;
+    }
+    QHash<QString, QTreeWidgetItem*> catItems, folderItems;
+ 
+    for (int j = 0; j < ecuCalDef->NameList.count() && j < ecuCalDef->CategoryList.count(); j++)
+    {
+        const QString cat = ecuCalDef->CategoryList.at(j);
+        if (cat.trimmed().isEmpty() || ecuCalDef->NameList.at(j).trimmed().isEmpty())
+            continue;
+ 
+        QTreeWidgetItem *catItem = catItems.value(cat);
+        if (!catItem)
         {
-            //emit LOG_D("Map category: " + ecuCalDef->CategoryList[j], true, true);
-            if (ecuCalDef->NameList[j] != "" && ecuCalDef->NameList[j] != " ")
+            int dash = cat.indexOf(" - ");
+            QString group = dash > 0 ? cat.left(dash).trimmed() : QString();
+            catItem = new QTreeWidgetItem();
+            catItem->setData(0, Qt::UserRole, cat);
+            if (!group.isEmpty() && groupCount.value(group) > 1)
             {
-                //emit LOG_D("Map: " + ecuCalDef->NameList[j], true, true);
-                treeCategoryCreated = false;
-                for (int i = 0; i < calDataTree->topLevelItemCount(); i++){
-                    if (calDataTree->topLevelItem(i)->text(0) == ecuCalDef->CategoryList[j]){
-                        treeCategoryCreated = true;
-                    }
-                }
-                if (!treeCategoryCreated)
+                QTreeWidgetItem *folder = folderItems.value(group);
+                if (!folder)
                 {
-                    //emit emit LOG_D("Create category: " + ecuCalDef->CategoryList[j], true, true);
-                    QTreeWidgetItem * topLevelDataTreeItem = new QTreeWidgetItem();
-                    topLevelDataTreeItem->setText(0, ecuCalDef->CategoryList[j]);
-                    calDataTree->addTopLevelItem(topLevelDataTreeItem);
-                    //treeChildCreated = false;
-                    if (ecuCalDef->CategoryExpandedList.at(j) == "1")
-                        topLevelDataTreeItem->setExpanded(true);
+                    folder = new QTreeWidgetItem();
+                    folder->setText(0, group);
+                    folder->setData(0, Qt::UserRole, "folder:" + group);
+                    calDataTree->addTopLevelItem(folder);
+                    folderItems.insert(group, folder);
+                    if (openFolders.contains(group))
+                        folder->setExpanded(true);
                 }
-                for (int i = 0; i < calDataTree->topLevelItemCount(); i++){
-                    if (calDataTree->topLevelItem(i)->text(0) == ecuCalDef->CategoryList[j]){
-                        //emit LOG_D("Add map: " + ecuCalDef->NameList[j] + " to category: " + ecuCalDef->CategoryList[j], true, true);
-                        QTreeWidgetItem * item = new QTreeWidgetItem();
-                        if (ecuCalDef->TypeList[j] == "1D" || ecuCalDef->TypeList[j] == "Selectable" || (ecuCalDef->YSizeList.at(j).toInt() == 1 && ecuCalDef->XSizeList.at(j).toInt() == 1))
-                            item->setIcon(0, QIcon(":/icons/1D-64.png"));
-                        else if (ecuCalDef->TypeList[j] == "2D")
-                            item->setIcon(0, QIcon(":/icons/2D-64.png"));
-                        else if (ecuCalDef->TypeList[j] == "3D")
-                            item->setIcon(0, QIcon(":/icons/3D-64.png"));
-                        if (ecuCalDef->VisibleList.at(j) == "1")
-                            item ->setCheckState(0,Qt::Checked);
-                        else
-                            item ->setCheckState(0,Qt::Unchecked);
-                        item->setText(0, ecuCalDef->NameList[j]);
-                        item->setText(1, QString::number(j));
-                        calDataTree->topLevelItem(i)->addChild(item);
-                        item->setToolTip(0, ecuCalDef->NameList[j] + ecuCalDef->DescriptionList[j]);
-                    }
-                }
+                catItem->setText(0, cat.mid(dash + 3).trimmed());
+                folder->addChild(catItem);
             }
+            else
+            {
+                catItem->setText(0, cat);
+                calDataTree->addTopLevelItem(catItem);
+            }
+            catItems.insert(cat, catItem);
+            if (j < ecuCalDef->CategoryExpandedList.count() && ecuCalDef->CategoryExpandedList.at(j) == "1")
+                catItem->setExpanded(true);
         }
+ 
+        QTreeWidgetItem * item = new QTreeWidgetItem();
+        if (ecuCalDef->TypeList[j] == "1D" || ecuCalDef->TypeList[j] == "Selectable" || (ecuCalDef->YSizeList.at(j).toInt() == 1 && ecuCalDef->XSizeList.at(j).toInt() == 1))
+            item->setIcon(0, QIcon(":/icons/1D-64.png"));
+        else if (ecuCalDef->TypeList[j] == "2D")
+            item->setIcon(0, QIcon(":/icons/2D-64.png"));
+        else if (ecuCalDef->TypeList[j] == "3D")
+            item->setIcon(0, QIcon(":/icons/3D-64.png"));
+        if (ecuCalDef->VisibleList.at(j) == "1")
+            item->setCheckState(0, Qt::Checked);
+        else
+            item->setCheckState(0, Qt::Unchecked);
+        item->setText(0, ecuCalDef->NameList[j]);
+        item->setText(1, QString::number(j));
+        catItem->addChild(item);
+        item->setToolTip(0, ecuCalDef->NameList[j] + ecuCalDef->DescriptionList[j]);
     }
 
     return calDataTree;
@@ -137,6 +161,11 @@ QTreeWidget *CalibrationTreeWidget::buildCalibrationDataTree(QTreeWidget *dataTr
 
 void *CalibrationTreeWidget::calibrationDataTreeWidgetItemExpanded(FileActions::EcuCalDefStructure *ecuCalDef, QString categoryName)
 {
+        if (categoryName.startsWith("folder:"))   // R36S: a folder such as Vmod
+    {
+        openFolders.insert(categoryName.mid(7));
+        return NULL;
+    }
     for (int i = 0; i < ecuCalDef->CategoryList.count(); i++)
     {
         if (ecuCalDef->CategoryList.at(i) == categoryName)
@@ -150,6 +179,11 @@ void *CalibrationTreeWidget::calibrationDataTreeWidgetItemExpanded(FileActions::
 
 void *CalibrationTreeWidget::calibrationDataTreeWidgetItemCollapsed(FileActions::EcuCalDefStructure *ecuCalDef, QString categoryName)
 {
+        if (categoryName.startsWith("folder:"))   // R36S: a folder such as Vmod
+    {
+        openFolders.remove(categoryName.mid(7));
+        return NULL;
+    }
     for (int i = 0; i < ecuCalDef->CategoryList.count(); i++)
     {
         if (ecuCalDef->CategoryList.at(i) == categoryName)

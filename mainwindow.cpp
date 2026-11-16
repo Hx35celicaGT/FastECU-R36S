@@ -1951,7 +1951,7 @@ void MainWindow::calibration_data_treewidget_item_selected(QTreeWidgetItem* item
     if (ui->calibrationDataTreeWidget->indexOfTopLevelItem(item) > -1){
         hierarchyLevel = 1;
     }
-    else if (ui->calibrationDataTreeWidget->indexOfTopLevelItem(item->parent()) > -1){
+    else if (item->parent() && !item->text(1).isEmpty()){   // R36S: a map at any depth (folders have no map number)
         hierarchyLevel = 2;
 
         QTreeWidgetItem *selectedFilesTreeItem = ui->calibrationFilesTreeWidget->selectedItems().at(0);
@@ -2014,9 +2014,11 @@ void MainWindow::calibration_data_treewidget_item_expanded(QTreeWidgetItem* item
 {
     QTreeWidgetItem *selectedItem = ui->calibrationFilesTreeWidget->selectedItems().at(0);
 
-    int itemIndex = ui->calibrationDataTreeWidget->indexOfTopLevelItem(item);
     int romNumber = ui->calibrationFilesTreeWidget->indexOfTopLevelItem(selectedItem);
-    QString categoryName = ui->calibrationDataTreeWidget->topLevelItem(itemIndex)->text(0);
+    // R36S: the full category name (or "folder:Vmod") is kept in UserRole; ROM Info has none
+    QString categoryName = item->data(0, Qt::UserRole).toString();
+    if (categoryName.isEmpty())
+        categoryName = item->text(0);
 
     calibrationTreeWidget->calibrationDataTreeWidgetItemExpanded(ecuCalDef[romNumber], categoryName);
 }
@@ -2025,9 +2027,11 @@ void MainWindow::calibration_data_treewidget_item_collapsed(QTreeWidgetItem* ite
 {
     QTreeWidgetItem *selectedItem = ui->calibrationFilesTreeWidget->selectedItems().at(0);
 
-    int itemIndex = ui->calibrationDataTreeWidget->indexOfTopLevelItem(item);
     int romNumber = ui->calibrationFilesTreeWidget->indexOfTopLevelItem(selectedItem);
-    QString categoryName = ui->calibrationDataTreeWidget->topLevelItem(itemIndex)->text(0);
+    // R36S: the full category name (or "folder:Vmod") is kept in UserRole; ROM Info has none
+    QString categoryName = item->data(0, Qt::UserRole).toString();
+    if (categoryName.isEmpty())
+        categoryName = item->text(0);
 
     calibrationTreeWidget->calibrationDataTreeWidgetItemCollapsed(ecuCalDef[romNumber], categoryName);
 }
@@ -2038,26 +2042,23 @@ void MainWindow::close_calibration()
 
     int romNumber = ui->calibrationFilesTreeWidget->indexOfTopLevelItem(selectedItem);
     int romIndex = ui->calibrationFilesTreeWidget->selectedItems().at(0)->text(2).toInt();
-
-    for (int i = 0; i < ui->calibrationDataTreeWidget->topLevelItemCount(); i++)
+    // R36S: every map in the list, also the ones inside folders
+    for (QTreeWidgetItemIterator it(ui->calibrationDataTreeWidget); *it; ++it)
     {
-        for (int j = 0; j < ui->calibrationDataTreeWidget->topLevelItem(i)->childCount(); j++)
+        QTreeWidgetItem *mapItem = *it;
+        if (mapItem->text(1).isEmpty())
+            continue;                    // folders, categories, ROM Info lines
+        for (int k = 0; k < ui->mdiArea->subWindowList().count(); k++)
         {
-            for (int k = 0; k < ui->mdiArea->subWindowList().count(); k++)
+            int mapNumber = mapItem->text(1).toInt();
+            QString mapName = mapItem->text(0);
+ 
+            QString calMapWindowName = QString::number(romIndex) + "," + QString::number(mapNumber) + "," + mapName;
+            QMdiSubWindow *w = ui->mdiArea->subWindowList().at(k);
+            if (w->objectName().startsWith(calMapWindowName))
             {
-                int mapNumber = ui->calibrationDataTreeWidget->topLevelItem(i)->child(j)->text(1).toInt();
-                QString mapName = ui->calibrationDataTreeWidget->topLevelItem(i)->child(j)->text(0);
-                QString mapType = ecuCalDef[romNumber]->TypeList.at(mapNumber);
-
-                QString calMapWindowName = QString::number(romIndex) + "," + QString::number(mapNumber) + "," + mapName;
-                QMdiSubWindow *w = ui->mdiArea->subWindowList().at(k);
-                if (w->objectName().startsWith(calMapWindowName))
-                {
-                    ui->mdiArea->removeSubWindow(w);
-                }
-
+                ui->mdiArea->removeSubWindow(w);
             }
-
         }
     }
     delete ui->calibrationFilesTreeWidget->takeTopLevelItem(romNumber);
@@ -2118,12 +2119,12 @@ void MainWindow::close_calibration_map(QObject* obj)
     int romIndex = selectedItem->text(2).toInt();
 
     QTreeWidgetItem *item;
-    for(int i = 0 ; i < ui->calibrationDataTreeWidget->topLevelItemCount(); i++)
+    for (QTreeWidgetItemIterator it(ui->calibrationDataTreeWidget); *it; ++it)   // R36S: maps inside folders too
     {
-        for(int j = 0 ; j < ui->calibrationDataTreeWidget->topLevelItem(i)->childCount(); j++)
         {
-            item = ui->calibrationDataTreeWidget->topLevelItem(i)->child(j);
-            if (item->text(0) == mapName)
+            item = *it;
+            if (!item->text(1).isEmpty() && item->text(0) == mapName)
+
             {
                 if (mapRomNumber == romIndex)
                     item->setCheckState(0, Qt::Unchecked);
@@ -2438,15 +2439,17 @@ bool MainWindow::eventFilter(QObject *target, QEvent *event)
         }
         if (key == Qt::Key_Left)
         {
-            QTreeWidgetItem *top = item->parent() ? item->parent() : item;
-            tree->setCurrentItem(top);
-            top->setExpanded(false);
+            // R36S: on an open folder / category, close it; otherwise go up one level and close that
+            QTreeWidgetItem *up = (item->childCount() && item->isExpanded()) ? item
+                                : (item->parent() ? item->parent() : item);
+            tree->setCurrentItem(up);
+            up->setExpanded(false);
             return true;
         }
         // Enter (Y)
-        if (!item->parent())
+        if (item->childCount())
         {
-            item->setExpanded(!item->isExpanded());   // on a category: open / close it
+            item->setExpanded(!item->isExpanded());   // on a folder or category: open / close it
             return true;
         }
         QList<QTreeWidgetItem*> roms = ui->calibrationFilesTreeWidget->selectedItems();
