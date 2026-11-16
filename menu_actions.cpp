@@ -249,18 +249,43 @@ void MainWindow::inc_dec_value(QString action)
 
                         map_data_value.float_value = 0;
 
+                        // Step sizes. Works the same for RomRaider and EcuFlash definitions.
+                        // Fine: never smaller than one shown digit (else taps change nothing you can see).
+                        // Coarse: if the definition's coarse is no bigger than ~1 fine/stored step, use 5 of them.
+                        float fine_step = map_fine_inc_value;
+                        float coarse_step = map_coarse_inc_value;
+                        if (map_format.trimmed().contains('0'))
+                        {
+                            float display_unit = 1.0f;
+                            for (int d = 0; d < get_mapvalue_decimal_count(map_format); d++)
+                                display_unit /= 10.0f;
+                            if (fine_step < display_unit)
+                                fine_step = display_unit;
+                        }
+                        float stored_step = 0.0f;
+                        if (map_value_storagetype != "float")
+                        {
+                            double raw_now = rom_data_value.toDouble();
+                            double val_now = fileActions->calculate_value_from_expression(fileActions->parse_stringlist_from_expression_string(map_value_from_byte, QString::number(raw_now, 'g', 12)));
+                            double val_next = fileActions->calculate_value_from_expression(fileActions->parse_stringlist_from_expression_string(map_value_from_byte, QString::number(raw_now + 1, 'g', 12)));
+                            stored_step = (float)qAbs(val_next - val_now);
+                        }
+                        float base_step = qMax(fine_step, stored_step);
+                        if (base_step > 0.0f && coarse_step <= 1.5f * base_step)
+                            coarse_step = 5.0f * base_step;
+
                         do {
                             if (map_coarse_inc_value == 0 || map_fine_inc_value == 0)
                                 QMessageBox::warning(this, tr("Set value"), "Fine / Coarse inc value not set or set to zero in definition file!");
 
                             if (action == "coarse_inc")
-                                map_item_value += map_coarse_inc_value;
+                                map_item_value += coarse_step;
                             if (action == "fine_inc")
-                                map_item_value += map_fine_inc_value;
+                                map_item_value += fine_step;
                             if (action == "coarse_dec")
-                                map_item_value -= map_coarse_inc_value;
+                                map_item_value -= coarse_step;
                             if (action == "fine_dec")
-                                map_item_value -= map_fine_inc_value;
+                                map_item_value -= fine_step;
 
                             // min only stops a decrease, max only stops an increase: a value already
                             // outside the limits (or just above a max the ROM can't store exactly) can still move back
