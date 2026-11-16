@@ -10,6 +10,22 @@ void r36sShowCsvState(QMainWindow *win, bool armed, bool recording);
 void r36sSetMenuChecked(QMenuBar *bar, const QString &text, bool checked);
 QString r36sSetValueDialog(QWidget *parent, QTableWidget *table, bool *ok);
 
+// The raw ROM value (after the to-byte formula) in the form set_rom_data_value() writes.
+// Float tables keep the float; integer tables are rounded and kept as integer bits.
+static float rom_value_for_write(const QString &storagetype, QString &rom_value)
+{
+    union { uint32_t u; float f; } v;
+    if (storagetype == "float")
+    {
+        v.f = rom_value.toFloat();
+        return v.f;
+    }
+    qint64 raw = qRound64(rom_value.toDouble());
+    rom_value = QString::number(raw);
+    v.u = (uint32_t)raw;
+    return v.f;
+}
+
 void MainWindow::menu_action_triggered(QString action)
 {
         // R36S: ignore Logging/CSV/Connect/Disconnect during a ROM read/write, and Start while the CSV records
@@ -314,7 +330,7 @@ void MainWindow::inc_dec_value(QString action)
                         if (map_data_value.float_value == 0)
                             map_data_value.float_value = 0.0f;
 
-                        map_data_value.dword_value = new_rom_data_value.toInt();
+                        map_data_value.float_value = rom_value_for_write(map_value_storagetype, new_rom_data_value);
                         set_rom_data_value(rom_number, map_data_address, map_value_index, map_value_storagetype, map_value_endian, map_data_value.float_value);
                     }
                 }
@@ -468,7 +484,7 @@ void MainWindow::set_value()
                             if (map_max_value != " " && map_item_value > map_max_value.toFloat())
                                 map_item_value = map_max_value.toFloat();
 
-                            rom_data_value = QString::number(fileActions->calculate_value_from_expression(fileActions->parse_stringlist_from_expression_string(map_value_to_byte, QString::number(map_item_value))));
+                            rom_data_value = QString::number(fileActions->calculate_value_from_expression(fileActions->parse_stringlist_from_expression_string(map_value_to_byte, QString::number(map_item_value, 'g', 9))), 'g', 9);
                             map_data_value.dword_value = rom_data_value.toUInt();
                             if (map_value_storagetype == "float")
                                 map_data_value.dword_value = (uint32_t)(qRound(map_data_value.float_value));
@@ -479,7 +495,7 @@ void MainWindow::set_value()
                             map_data_cell_text.replace(j * map_x_size + i, QString::number(map_item_value));
                             qDebug() << j * map_x_size + i << QString::number(map_item_value);
 
-                            map_data_value.dword_value = rom_data_value.toInt();
+                            map_data_value.float_value = rom_value_for_write(map_value_storagetype, rom_data_value);
                             set_rom_data_value(rom_number, map_data_address, map_value_index, map_value_storagetype, map_value_endian, map_data_value.float_value);
                         }
                     }
@@ -490,6 +506,7 @@ void MainWindow::set_value()
                     else
                         ecuCalDef[rom_number]->MapData.replace(map_number, map_data_cell_text.join(","));
 
+                    ui->mdiArea->setActiveSubWindow(w);   // the Set value box took the focus: redraw this table
                     set_maptablewidget_items();
                 }
             }
@@ -662,7 +679,7 @@ void MainWindow::interpolate_value(QString action)
 
                         map_data_cell_text.replace((firstRow + j) * map_x_size + firstCol + i, QString::number(map_item_value));
 
-                        map_data_value.dword_value = rom_data_value.toInt();
+                        map_data_value.float_value = rom_value_for_write(map_value_storagetype, rom_data_value);
                         set_rom_data_value(rom_number, map_data_address, map_value_index, map_value_storagetype, map_value_endian, map_data_value.float_value);
                     }
                 }
@@ -771,7 +788,7 @@ void MainWindow::paste_value()
                                 else
                                     rom_data_value = QString::number(qRound(rom_data_value.toFloat()));
 
-                                map_data_value.dword_value = rom_data_value.toInt();
+                                map_data_value.float_value = rom_value_for_write(map_value_storagetype, rom_data_value);
                                 set_rom_data_value(rom_number, map_data_address, map_value_index, map_value_storagetype, map_value_endian, map_data_value.float_value);
                             }
                         }
@@ -1202,6 +1219,8 @@ void MainWindow::set_maptablewidget_items()
                     else
                         cellItem = mapTableWidget->item(0, i);
 
+                    if (!cellItem || i >= xScaleCellText.count())
+                        continue;
                     cellItem->setTextAlignment(Qt::AlignCenter);
                     cellItem->setFont(cellFont);
 
@@ -1227,6 +1246,8 @@ void MainWindow::set_maptablewidget_items()
                 {
                     QTableWidgetItem *cellItem;
                     cellItem = mapTableWidget->item(i + 1, 0);
+                    if (!cellItem)
+                        continue;
 
                     cellItem->setTextAlignment(Qt::AlignCenter);
                     cellItem->setFont(cellFont);
@@ -1239,7 +1260,9 @@ void MainWindow::set_maptablewidget_items()
             {
                 int yPos = 0;
                 int xPos = 0;
-                if (ecuCalDef[mapRomNumber]->XSizeList.at(mapNumber).toUInt() > 1)
+                // same rule as the map window uses when it is built (calibration_maps.cpp):
+                // a static label row pushes the values down one row even on a one-value table
+                if (ecuCalDef[mapRomNumber]->XSizeList.at(mapNumber).toUInt() > 1 || ecuCalDef[mapRomNumber]->XScaleTypeList.at(mapNumber) == "Static Y Axis" || ecuCalDef[mapRomNumber]->XScaleTypeList.at(mapNumber) == "Static X Axis")
                     yPos = i / xSize + ySizeOffset;
                 else
                     yPos = i / xSize;
@@ -1249,8 +1272,16 @@ void MainWindow::set_maptablewidget_items()
                     xPos = i - (yPos - ySizeOffset) * xSize;
 
                 //qDebug() << "X pos:" << xPos << "Y pos:" << yPos;
+                // A 1D map window has one cell at 0,0 even when the definition gives it an axis
+                if (ecuCalDef[mapRomNumber]->TypeList.at(mapNumber) == "1D")
+                {
+                    yPos = 0;
+                    xPos = 0;
+                }
                 QTableWidgetItem *cellItem;// = new QTableWidgetItem;
                 cellItem = mapTableWidget->item(yPos, xPos);
+                if (!cellItem || i >= mapDataCellText.count())
+                    continue;
 
                 cellItem->setTextAlignment(Qt::AlignCenter);
                 cellItem->setFont(cellFont);
@@ -1337,6 +1368,7 @@ QString MainWindow::get_rom_data_value(uint8_t rom_number, uint32_t data_address
     return value;
 }
 
+
 void MainWindow::set_rom_data_value(uint8_t rom_number, uint32_t data_address, uint16_t value_index, QString storagetype, QString endian, float map_value)
 {
     union map_data{
@@ -1366,16 +1398,15 @@ void MainWindow::set_rom_data_value(uint8_t rom_number, uint32_t data_address, u
     if (ecuCalDef[rom_number]->RomInfo.at(FlashMethod) == "wrx02" && ecuCalDef[rom_number]->FileSize.toUInt() < (190 * 1024) && byte_address > 0x27FFF)
         byte_address -= 0x8000;
 
+    // Same byte order as the ROM is read with (file_actions.cpp): most significant byte first
+    // (Subaru / Denso default), floats included. Only a non-float table marked endian="little"
+    // is written least significant byte first.
     for (int k = 0; k < storagesize; k++)
     {
-        if (endian == "little" || storagetype == "float")
-        {
-            ecuCalDef[rom_number]->FullRomData[byte_address + k] = (uint8_t)(map_data_value.byte_value[storagesize - 1 - k]);
-        }
-        else
-        {
+        if (endian == "little" && storagetype != "float")
             ecuCalDef[rom_number]->FullRomData[byte_address + k] = (uint8_t)(map_data_value.byte_value[k]);
-        }
+        else
+            ecuCalDef[rom_number]->FullRomData[byte_address + k] = (uint8_t)(map_data_value.byte_value[storagesize - 1 - k]);
     }
 }
 
@@ -1394,8 +1425,10 @@ int MainWindow::get_map_cell_colors(FileActions::EcuCalDefStructure *ecuCalDef, 
     float mapMaxValue = 0;
     float scale_start = (210.0/360.0);
 
-    mapMinValue = ecuCalDef->MapCellColorMin.at(mapIndex).toFloat();
-    mapMaxValue = ecuCalDef->MapCellColorMax.at(mapIndex).toFloat();
+    mapMinValue = ecuCalDef->MapCellColorMin.value(mapIndex).toFloat();
+    mapMaxValue = ecuCalDef->MapCellColorMax.value(mapIndex).toFloat();
+    if (mapMaxValue - mapMinValue == 0.0f)
+        mapMaxValue = mapMinValue + 1.0f;     // one value or all the same: avoid divide by zero
 
     QColor color;
     float color_scale = (1 - (mapDataValue - mapMinValue) / (mapMaxValue - mapMinValue)) * scale_start;
