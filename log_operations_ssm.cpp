@@ -599,8 +599,9 @@ static void r36sArduinoLine(const QByteArray &raw)
 // Turn it on in log_setup.txt (one device on the jack at a time):
 //   lm2 = jack              Innovate LM-2 (MTS) -> Wideband Lambda / AFR / Status (LM-2)
 //   arduino_port = jack     the Nano's CSV through the jack instead of its own USB cable
-//   jack_baud = 19200       optional (MTS is always 19200)
-enum R36SJackMode { R36S_JACK_OFF, R36S_JACK_LM2, R36S_JACK_ARDUINO };
+//   aem = jack              AEM UEGO serial (9600, "14.7") -> Wideband AFR / Lambda (AEM)
+//   jack_baud = 19200       optional (MTS is always 19200; AEM defaults to 9600)
+enum R36SJackMode { R36S_JACK_OFF, R36S_JACK_LM2, R36S_JACK_ARDUINO, R36S_JACK_AEM };
 static R36SJackMode r36sJackMode = R36S_JACK_OFF;
 static int r36sJackBaud = 19200;
 static QByteArray r36sJackBuffer;
@@ -622,7 +623,7 @@ static void r36sJackAddValue(FileActions::LogValuesStructure *lv, const QString 
     lv->log_value_protocol.append(r36sArduinoProtocol);
     lv->log_value_id.append(id);
     lv->log_value_name.append(name);
-    lv->log_value_description.append("Innovate MTS on the Tactrix 2.5 mm jack");
+    lv->log_value_description.append("Tactrix 2.5 mm jack");
     lv->log_value_ecu_byte_index.append("ard");   // not requested from the ECU
     lv->log_value_ecu_bit.append("0");
     lv->log_value_target.append("1");
@@ -676,6 +677,71 @@ static void r36sLm2Packet(const QByteArray &p)
     r36sJackSet(lv, "LM2_AFR", lambda * afrMult, 2, func == 0);
 }
 
+// R36S: AEM UEGO serial (X-Series 30-0300/0310/0333/0334, legacy 30-4110): 9600 8N1, "14.7\r\n".
+// The gauge sends what it displays (AFR on the gasoline scale, or lambda). Under 3.0 = lambda.
+static QByteArray r36sAemBuffer;
+static QElapsedTimer r36sAemLastLine;
+ 
+static void r36sAemFeed(FileActions::LogValuesStructure *lv, const QByteArray &data)
+{
+    r36sAemBuffer.append(data);
+    int nl;
+    while ((nl = r36sAemBuffer.indexOf('\n')) >= 0)
+    {
+        QByteArray line = r36sAemBuffer.left(nl).trimmed();   // trimmed() drops the \r
+        r36sAemBuffer.remove(0, nl + 1);
+        if (line.isEmpty())
+            continue;
+        r36sAemLastLine.start();
+        bool ok = false;
+        double v = line.toDouble(&ok);
+        if (!ok || v <= 0.0)                                   // error text from the gauge
+        {
+            r36sJackSet(lv, "AEM_AFR", 0, 0, false);
+            r36sJackSet(lv, "AEM_LAMBDA", 0, 0, false);
+            continue;
+        }
+        double lambda = (v < 3.0) ? v : v / 14.7;
+        r36sJackSet(lv, "AEM_LAMBDA", lambda, 3, true);
+        r36sJackSet(lv, "AEM_AFR", lambda * 14.7, 2, true);
+    }
+    if (r36sAemBuffer.size() > 256) r36sAemBuffer.clear();     // no line endings = wrong baud/wiring
+    if (r36sAemLastLine.isValid() && r36sAemLastLine.elapsed() > 1500)
+    {
+        r36sJackSet(lv, "AEM_AFR", 0, 0, false);               // AEM stopped sending
+        r36sJackSet(lv, "AEM_LAMBDA", 0, 0, false);
+    }
+}
+
+// R36S: Innovate MTS stream (LM-2 / MTX). buf keeps the part of a packet not complete yet.
+// Used for the Tactrix AUX and for a USB serial adapter (PC).
+static void r36sMtsFeed(FileActions::LogValuesStructure *lv, QByteArray &buf, const QByteArray &data)
+{
+    buf.append(data);
+    while (buf.size() >= 2)
+    {
+        // MTS header word: bits 15, 13, 9 and 7 set; length in words = bit 8 + bits 6..0
+        int i = 0;
+        while (i + 1 < buf.size() &&
+               !(((uint8_t)buf.at(i) & 0xA2) == 0xA2 && ((uint8_t)buf.at(i + 1) & 0x80) == 0x80))
+            i++;
+        if (i)
+            buf.remove(0, i);
+        if (buf.size() < 2)
+            break;
+        int words = (((uint8_t)buf.at(0) & 0x01) << 7) | ((uint8_t)buf.at(1) & 0x7F);
+        int need = 2 + 2 * words;
+        if (buf.size() < need)
+            break;
+        r36sLm2Packet(buf.left(need));
+        buf.remove(0, need);
+    }
+    if (buf.size() > 4096) buf.clear();
+    if (r36sJackLastPacket.isValid() && r36sJackLastPacket.elapsed() > 1500)
+        for (const char *id : { "LM2_LAMBDA", "LM2_AFR", "LM2_STATUS" })
+            r36sJackSet(lv, id, 0, 0, false);    // LM-2 stopped sending
+}
+
 static void r36sJackFeed(const QByteArray &data)
 {
     FileActions::LogValuesStructure *lv = r36sArduinoLv;
@@ -699,30 +765,14 @@ static void r36sJackFeed(const QByteArray &data)
             }
         return;
     }
-    r36sJackBuffer.append(data);
-    while (r36sJackBuffer.size() >= 2)
+    if (r36sJackMode == R36S_JACK_AEM)
     {
-        // MTS header word: bits 15, 13, 9 and 7 set; length in words = bit 8 + bits 6..0
-        int i = 0;
-        while (i + 1 < r36sJackBuffer.size() &&
-               !(((uint8_t)r36sJackBuffer.at(i) & 0xA2) == 0xA2 && ((uint8_t)r36sJackBuffer.at(i + 1) & 0x80) == 0x80))
-            i++;
-        if (i)
-            r36sJackBuffer.remove(0, i);
-        if (r36sJackBuffer.size() < 2)
-            break;
-        int words = (((uint8_t)r36sJackBuffer.at(0) & 0x01) << 7) | ((uint8_t)r36sJackBuffer.at(1) & 0x7F);
-        int need = 2 + 2 * words;
-        if (r36sJackBuffer.size() < need)
-            break;
-        r36sLm2Packet(r36sJackBuffer.left(need));
-        r36sJackBuffer.remove(0, need);
+        r36sAemFeed(lv, data);
+        return;
     }
-    if (r36sJackBuffer.size() > 4096) r36sJackBuffer.clear();
-    if (r36sJackLastPacket.isValid() && r36sJackLastPacket.elapsed() > 1500)
-        for (const char *id : { "LM2_LAMBDA", "LM2_AFR", "LM2_STATUS" })
-            r36sJackSet(lv, id, 0, 0, false);    // LM-2 stopped sending
+    r36sMtsFeed(lv, r36sJackBuffer, data);
 }
+
 
 // Called by MainWindow::read_log_serial_data() after each Tactrix read
 void r36sJackPoll(SerialPortActions *serial)
@@ -998,6 +1048,8 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
 {
     QString portSetting, baud = "115200";
     QString lm2Setting;                          // R36S: jack
+    QString aemSetting;                          // R36S: AEM on the jack
+    bool jackBaudGiven = false;    
     r36sJackBaud = 19200;
     QString channelsPath = QDir(R36S_FILES_DIR).filePath("arduino_channels.txt");
     r36sArduinoUnits.clear();
@@ -1016,7 +1068,8 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
             if (kind == "arduino_port") portSetting = val;
             else if (kind == "arduino_baud") baud = val;
                         else if (kind == "lm2") lm2Setting = val.toLower();                          // R36S: jack
-            else if (kind == "jack_baud") r36sJackBaud = val.toInt() > 0 ? val.toInt() : 19200;
+            else if (kind == "jack_baud") { r36sJackBaud = val.toInt() > 0 ? val.toInt() : 19200; jackBaudGiven = true; }
+            else if (kind == "aem") aemSetting = val.toLower();                          // R36S: jack
             else if (kind == "arduino_channels")
                 channelsPath = QDir::isAbsolutePath(val) ? val : QDir(R36S_FILES_DIR).filePath(val);
             else if (kind == "arduino_units")
@@ -1044,7 +1097,19 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
         r36sJackAddValue(lv, "LM2_STATUS", "Wideband Status (LM-2)", "code", "0");
         jackNotes << "LM-2: reading the Tactrix 2.5 mm jack at " + QString::number(r36sJackBaud) + " (status 0 = ok, 4 = warming up)";
     }
-
+    else if (aemSetting == "jack")
+    {
+        r36sJackMode = R36S_JACK_AEM;
+        if (!jackBaudGiven)
+            r36sJackBaud = 9600;                 // AEM serial is 9600 8N1
+        r36sArduinoLv = lv;
+        r36sArduinoProtocol = protocol;
+        r36sAemBuffer.clear();
+        r36sAemLastLine.invalidate();
+        r36sJackAddValue(lv, "AEM_AFR", "Wideband AFR (AEM)", "AFR", "0.00");
+        r36sJackAddValue(lv, "AEM_LAMBDA", "Wideband Lambda (AEM)", "lambda", "0.000");
+        jackNotes << "AEM: reading the Tactrix 2.5 mm jack at " + QString::number(r36sJackBaud);
+    }
 
     if (portSetting.isEmpty())
     {
@@ -1123,6 +1188,100 @@ QStringList r36sArduinoUpdate(FileActions::LogValuesStructure *lv, const QString
     return QStringList() << "Arduino: reading " + port + " at " + baud;
 }
 // ===== end R36S Arduino =====
+
+// ===== R36S: AEM / Innovate wideband through a USB serial adapter (PC) =====
+// log_setup.txt:  aem = auto   or  aem = /dev/ttyUSB0      (aem = jack is the Tactrix AUX instead)
+//                 lm2 = auto   or  lm2 = /dev/ttyUSB0      (lm2 = jack is the Tactrix AUX instead)
+// Uses the system's serial driver, so it is for the PC: the R36S has no driver for USB serial
+// adapters (its Arduino over USB is read directly from the FTDI / CH340 chip instead).
+static QSerialPort *r36sWbPort = nullptr;
+static int r36sWbDevice = 0;                     // 0 off, 1 AEM, 2 LM-2 / MTX
+static QByteArray r36sWbMtsBuffer;
+ 
+static QString r36sWidebandUsbUpdate(FileActions::LogValuesStructure *lv, const QString &protocol)
+{
+    QString aem, lm2;
+    QFile f(QDir(R36S_FILES_DIR).filePath("log_setup.txt"));
+    if (f.open(QFile::ReadOnly | QFile::Text))
+    {
+        QTextStream in(&f);
+        while (!in.atEnd())
+        {
+            QString t = in.readLine().trimmed();
+            if (t.startsWith('#')) continue;
+            int eq = t.indexOf('=');
+            if (eq < 0) continue;
+            QString kind = t.left(eq).trimmed().toLower(), val = t.mid(eq + 1).trimmed();
+            if (kind == "aem") aem = val;
+            else if (kind == "lm2") lm2 = val;
+        }
+    }
+    QString setting;
+    int dev = 0;
+    if (!aem.isEmpty() && aem.toLower() != "jack") { dev = 1; setting = aem; }
+    else if (!lm2.isEmpty() && lm2.toLower() != "jack") { dev = 2; setting = lm2; }
+    QString name = dev == 1 ? "AEM" : "LM-2";
+ 
+    if (!r36sWbPort)
+    {
+        r36sWbPort = new QSerialPort(qApp);
+        QObject::connect(r36sWbPort, &QSerialPort::readyRead, []() {
+            QByteArray data = r36sWbPort->readAll();
+            if (!r36sArduinoLv) return;
+            if (r36sWbDevice == 1) r36sAemFeed(r36sArduinoLv, data);
+            else if (r36sWbDevice == 2) r36sMtsFeed(r36sArduinoLv, r36sWbMtsBuffer, data);
+        });
+        QObject::connect(r36sWbPort, &QSerialPort::errorOccurred, [](QSerialPort::SerialPortError e) {
+            if (e == QSerialPort::ResourceError) r36sWbPort->close();   // unplugged; reopened on next Logging on
+        });
+        // Values go to -- if the wideband stops sending (the feeds check the time)
+        QTimer *stale = new QTimer(qApp);
+        QObject::connect(stale, &QTimer::timeout, []() {
+            if (!r36sArduinoLv) return;
+            if (r36sWbDevice == 1) r36sAemFeed(r36sArduinoLv, QByteArray());
+            else if (r36sWbDevice == 2) r36sMtsFeed(r36sArduinoLv, r36sWbMtsBuffer, QByteArray());
+        });
+        stale->start(500);
+    }
+    if (r36sWbPort->isOpen() && dev == r36sWbDevice && r36sWbPort->portName() == QSerialPortInfo(r36sArduinoFindPort(setting)).portName())
+        return name + ": reading " + r36sWbPort->portName() + " (USB)";
+    r36sWbPort->close();
+    r36sWbDevice = dev;
+    if (dev == 0)
+        return QString();
+ 
+    r36sArduinoLv = lv;
+    r36sArduinoProtocol = protocol;
+    if (dev == 1)
+    {
+        r36sAemBuffer.clear();
+        r36sAemLastLine.invalidate();
+        r36sJackAddValue(lv, "AEM_AFR", "Wideband AFR (AEM)", "AFR", "0.00");
+        r36sJackAddValue(lv, "AEM_LAMBDA", "Wideband Lambda (AEM)", "lambda", "0.000");
+    }
+    else
+    {
+        r36sWbMtsBuffer.clear();
+        r36sJackLastPacket.invalidate();
+        r36sJackAddValue(lv, "LM2_LAMBDA", "Wideband Lambda (LM-2)", "lambda", "0.000");
+        r36sJackAddValue(lv, "LM2_AFR", "Wideband AFR (LM-2)", "AFR", "0.00");
+        r36sJackAddValue(lv, "LM2_STATUS", "Wideband Status (LM-2)", "code", "0");
+    }
+    QString port = r36sArduinoFindPort(setting);
+    if (port.isEmpty())
+        return name + ": no USB serial port found (USB widebands are for the PC; the R36S has no driver for USB serial adapters)";
+    int baud = dev == 1 ? 9600 : 19200;          // AEM 9600 8N1, Innovate MTS 19200 8N1
+    r36sWbPort->setPortName(port);
+    r36sWbPort->setBaudRate(baud);
+    r36sWbPort->setDataBits(QSerialPort::Data8);
+    r36sWbPort->setParity(QSerialPort::NoParity);
+    r36sWbPort->setStopBits(QSerialPort::OneStop);
+    r36sWbPort->setFlowControl(QSerialPort::NoFlowControl);
+    if (!r36sWbPort->open(QIODevice::ReadOnly))
+        return name + ": could not open " + port + " (" + r36sWbPort->errorString() + ")";
+    return name + ": reading " + port + " at " + QString::number(baud) + " (USB)";
+}
+// ===== end R36S USB wideband =====
 
 // ===== R36S: math channels and warnings =====
 // log_setup.txt:
@@ -1401,6 +1560,10 @@ void r36sApplyLogSetup(FileActions::LogValuesStructure *lv, const QString &proto
     r36sAddExtendedFor(lv, extraIds);
 
         notes << r36sArduinoUpdate(lv, protocol);   // R36S: Arduino values + port
+    {
+        QString wb = r36sWidebandUsbUpdate(lv, protocol);   // R36S: AEM / Innovate on a USB serial adapter (PC)
+        if (!wb.isEmpty()) notes << wb;
+    }        
 
     // R36S: math channels must exist before display/log/warn names are matched
     QStringList mathLines;
@@ -1875,6 +2038,446 @@ static void r36sSaveLogSetup(const QStringList &display, const QStringList &logg
     for (const QString &n : warns)    os << "warn = " << n << "\n";
 }
 
+// ===== R36S: save / open log setups (FastECU-Files/log_setups) =====
+// A setup holds the display / log / switch / warn / math lines of log_setup.txt.
+// Name: [LoggingID]_[Purpose]_[NN].txt, NN = next free number for that ID and purpose.
+// Save can replace an existing one (default: the one last opened or saved). Delete moves the
+// file to log_setups/deleted, so a wrong delete can be undone on the PC.
+#include <QDateTime>
+#include <QPushButton>
+#include <QVBoxLayout>
+#include <QKeyEvent>
+#include <QShortcut>
+#include <algorithm>
+ 
+static const QStringList R36S_SETUP_PURPOSES = {
+    "Tuning", "Driving", "Cruise", "WOT pulls", "Boost", "Fuel-Flex", "Knock", "Idle", "Cold start", "Testing" };
+ 
+static QString r36sLastSetup;   // file name last opened or saved (while FastECU runs)
+ 
+static QString r36sSetupsDir()
+{
+    QDir(R36S_FILES_DIR).mkpath("log_setups");
+    return QDir(R36S_FILES_DIR).filePath("log_setups");
+}
+ 
+// "WOT pulls" -> "WOT-pulls" in the file name (no spaces)
+static QString r36sSetupFileBase(const QString &id, const QString &purpose)
+{
+    QString p = purpose;
+    p.replace(' ', '-');
+    return (id.isEmpty() ? QString("NoID") : id) + "_" + p + "_";
+}
+ 
+// Existing files for this ID and purpose, oldest number first
+static QStringList r36sSetupFilesFor(const QString &id, const QString &purpose)
+{
+    QString base = r36sSetupFileBase(id, purpose);
+    QStringList out;
+    for (const QString &f : QDir(r36sSetupsDir()).entryList(QStringList() << base + "*.txt", QDir::Files, QDir::Name))
+    {
+        bool ok = false;
+        f.mid(base.length()).chopped(4).toInt(&ok);
+        if (ok) out << f;
+    }
+    return out;
+}
+ 
+static QString r36sNextSetupName(const QString &id, const QString &purpose)
+{
+    QString base = r36sSetupFileBase(id, purpose);
+    int maxN = 0;
+    for (const QString &f : r36sSetupFilesFor(id, purpose))
+        maxN = qMax(maxN, f.mid(base.length()).chopped(4).toInt());
+    // numbers in log_setups/deleted are not used again, so a deleted copy is never overwritten
+    for (const QString &f : QDir(QDir(r36sSetupsDir()).filePath("deleted")).entryList(QStringList() << base + "*.txt", QDir::Files))
+        maxN = qMax(maxN, f.mid(base.length()).chopped(4).toInt());
+    return base + QString("%1").arg(maxN + 1, 2, 10, QLatin1Char('0')) + ".txt";
+}
+ 
+// Lines of one setup file: kind = value (display / log / switch / warn / math), plus the saved time
+struct R36SSetupFile { QList<QPair<QString, QString> > lines; QString saved, id; int values = 0; };
+ 
+static R36SSetupFile r36sReadSetupFile(const QString &path)
+{
+    R36SSetupFile s;
+    QFile f(path);
+    if (!f.open(QFile::ReadOnly | QFile::Text))
+        return s;
+    QTextStream in(&f);
+    while (!in.atEnd())
+    {
+        QString t = in.readLine().trimmed();
+        if (t.startsWith("# saved "))
+        {
+            QStringList w = t.mid(8).split("  ECU ID ");
+            s.saved = w.value(0).trimmed();
+            s.id = w.value(1).trimmed();
+            continue;
+        }
+        if (t.isEmpty() || t.startsWith('#'))
+            continue;
+        int eq = t.indexOf('=');
+        if (eq < 0)
+            continue;
+        QString kind = t.left(eq).trimmed().toLower();
+        QString val = t.mid(eq + 1).trimmed();
+        if (!val.isEmpty() && (kind == "display" || kind == "log" || kind == "switch" || kind == "warn" || kind == "math"))
+        {
+            s.lines.append(qMakePair(kind, val));
+            if (kind == "display" || kind == "log" || kind == "switch")
+                s.values++;
+        }
+    }
+    return s;
+}
+ 
+static bool r36sWriteSetupFile(const QString &path, const QString &id, const QStringList &display, const QStringList &logged,
+                               const QStringList &switches, const QStringList &warns, const QStringList &maths)
+{
+    QFile out(path);
+    if (!out.open(QFile::WriteOnly | QFile::Text))
+        return false;
+    QTextStream os(&out);
+    os << "# FastECU log setup " << QFileInfo(path).completeBaseName() << "\n";
+    os << "# saved " << QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm") << "  ECU ID " << id << "\n";
+    os << "# Open it from View > Logger Setup... > Open setup... (any ECU ID; values this ECU does not have are listed before it loads)\n\n";
+    for (const QString &n : maths)    os << "math = " << n << "\n";
+    for (const QString &n : display)  os << "display = " << n << "\n";
+    for (const QString &n : logged)   os << "log = " << n << "\n";
+    for (const QString &n : switches) os << "switch = " << n << "\n";
+    for (const QString &n : warns)    os << "warn = " << n << "\n";
+    return true;
+}
+ 
+// Y / B question for the R36S (Yes = Y / Enter, No = B / Esc)
+static bool r36sAskYesNo(QWidget *parent, const QString &title, const QString &text)
+{
+    // Yes is the default so Y (Enter) answers yes; B (Esc) is no
+    return QMessageBox::question(parent, title, text + "\n\nY (Enter): yes     B (Esc): no",
+                                 QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes) == QMessageBox::Yes;
+}
+ 
+// Save: pick a purpose and New / Replace (Up / Down, Tab or Left / Right to move between them).
+// Returns the full path, or "" when cancelled.
+static QString r36sAskSetupName(QWidget *parent, const QString &id)
+{
+    QDialog d(parent);
+    d.setWindowTitle("Save log setup");
+    QVBoxLayout *lay = new QVBoxLayout(&d);
+    lay->addWidget(new QLabel("Purpose:"));
+    QComboBox *purpose = new QComboBox(&d);
+    purpose->addItems(R36S_SETUP_PURPOSES);
+    lay->addWidget(purpose);
+    lay->addWidget(new QLabel("Save as:"));
+    QComboBox *target = new QComboBox(&d);
+    lay->addWidget(target);
+    lay->addWidget(new QLabel("Up / Down: change     Left / Right: other choice\n"
+                              "Y (Enter): save     B (Esc): cancel"));
+ 
+    // Start on the purpose of the setup last opened or saved, if it was this ECU's
+    for (int i = 0; i < R36S_SETUP_PURPOSES.length(); i++)
+        if (!r36sLastSetup.isEmpty() && r36sLastSetup.startsWith(r36sSetupFileBase(id, R36S_SETUP_PURPOSES.at(i))))
+            purpose->setCurrentIndex(i);
+ 
+    auto fill = [&]() {
+        target->clear();
+        int pick = -1;
+        for (const QString &f : r36sSetupFilesFor(id, purpose->currentText()))
+        {
+            R36SSetupFile s = r36sReadSetupFile(QDir(r36sSetupsDir()).filePath(f));
+            target->addItem("Replace " + f.chopped(4) + "   (" + s.saved + ", " + QString::number(s.values) + " values)", f);
+            if (f == r36sLastSetup)
+                pick = target->count() - 1;
+        }
+        QString next = r36sNextSetupName(id, purpose->currentText());
+        target->addItem("New " + next.chopped(4), next);
+        target->setCurrentIndex(pick >= 0 ? pick : target->count() - 1);   // last one used, else New
+    };
+    QObject::connect(purpose, QOverload<int>::of(&QComboBox::currentIndexChanged), &d, [fill](int) { fill(); });
+    fill();
+ 
+    // Left / Right moves between the two choices (Up / Down changes the one you are on)
+    struct Hop : QObject {
+        QWidget *a, *b;
+        Hop(QWidget *a, QWidget *b, QObject *p) : QObject(p), a(a), b(b) {}
+        bool eventFilter(QObject *o, QEvent *e) override {
+            if (e->type() == QEvent::KeyPress) {
+                int k = static_cast<QKeyEvent*>(e)->key();
+                if (k == Qt::Key_Left || k == Qt::Key_Right) { (o == a ? b : a)->setFocus(); return true; }
+            }
+            return false;
+        }
+    };
+    Hop *hop = new Hop(purpose, target, &d);
+    purpose->installEventFilter(hop);
+    target->installEventFilter(hop);
+ 
+    QDialogButtonBox *bb = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
+    QObject::connect(bb, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+    QObject::connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+    lay->addWidget(bb);
+    target->setFocus();
+    while (true)
+    {
+        if (d.exec() != QDialog::Accepted)
+            return QString();
+        QString f = target->currentData().toString();
+        if (!target->currentText().startsWith("Replace ") ||
+            r36sAskYesNo(&d, "Save log setup", "Replace " + f.chopped(4) + " with what is in the window now?"))
+            return QDir(r36sSetupsDir()).filePath(f);
+    }
+}
+ 
+// Open: list of saved setups, this ECU ID first, newest first. Y / Enter / double-click opens.
+// X (right click) or Delete: move the highlighted one to log_setups/deleted.
+static QString r36sAskSetupFile(QWidget *parent, const QString &id)
+{
+    QDialog d(parent);
+    d.setWindowTitle("Open log setup");
+    QVBoxLayout *lay = new QVBoxLayout(&d);
+    QListWidget *list = new QListWidget(&d);
+    lay->addWidget(list);
+    lay->addWidget(new QLabel("Y (Enter): open     X (right-click, Delete key): delete     B (Esc): cancel"));
+ 
+    auto fill = [&]() {
+        struct Entry { QString file, saved; int values; bool mine; };
+        QList<Entry> entries;
+        for (const QString &f : QDir(r36sSetupsDir()).entryList(QStringList() << "*.txt", QDir::Files))
+        {
+            R36SSetupFile s = r36sReadSetupFile(QDir(r36sSetupsDir()).filePath(f));
+            entries << Entry{ f, s.saved, s.values, !id.isEmpty() && f.startsWith(id + "_") };
+        }
+        std::sort(entries.begin(), entries.end(), [](const Entry &a, const Entry &b) {
+            if (a.mine != b.mine) return a.mine;
+            return a.saved > b.saved;
+        });
+        int row = qMax(0, list->currentRow());
+        list->clear();
+        for (const Entry &e : entries)
+        {
+            QListWidgetItem *it = new QListWidgetItem(e.file.chopped(4) + "    " + e.saved +
+                                                      "    (" + QString::number(e.values) + " values)", list);
+            it->setData(Qt::UserRole, e.file);
+        }
+        list->setCurrentRow(qMin(row, list->count() - 1));
+    };
+    fill();
+    if (list->count() == 0)
+    {
+        QMessageBox::information(parent, "Open log setup", "No saved setups yet.\nUse Save setup... first.");
+        return QString();
+    }
+ 
+    auto removeCurrent = [&]() {
+        QListWidgetItem *it = list->currentItem();
+        if (!it)
+            return;
+        QString f = it->data(Qt::UserRole).toString();
+        if (!r36sAskYesNo(&d, "Delete log setup", "Delete " + f.chopped(4) + "?\n(It is moved to log_setups/deleted.)"))
+            return;
+        QDir dir(r36sSetupsDir());
+        dir.mkpath("deleted");
+        QString to = dir.filePath("deleted/" + f);
+        QFile::remove(to);                         // an older deleted copy with the same name
+        if (!QFile::rename(dir.filePath(f), to))
+        {
+            QMessageBox::warning(&d, "Delete log setup", "Could not move " + f);
+            return;
+        }
+        if (r36sLastSetup == f)
+            r36sLastSetup.clear();
+        fill();
+        if (list->count() == 0)
+            d.reject();
+    };
+    // X on the R36S is a right click; Delete on the PC keyboard
+    list->setContextMenuPolicy(Qt::CustomContextMenu);
+    QObject::connect(list, &QListWidget::customContextMenuRequested, &d, [&](const QPoint &pos) {
+        if (QListWidgetItem *it = list->itemAt(pos)) list->setCurrentItem(it);
+        removeCurrent();
+    });
+    QShortcut *del = new QShortcut(QKeySequence(Qt::Key_Delete), list);
+    QObject::connect(del, &QShortcut::activated, &d, [&]() { removeCurrent(); });
+ 
+    QDialogButtonBox *bb = new QDialogButtonBox(QDialogButtonBox::Open | QDialogButtonBox::Cancel);
+    QObject::connect(bb, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+    QObject::connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+    QObject::connect(list, &QListWidget::itemActivated, &d, [&d](QListWidgetItem *) { d.accept(); });
+    lay->addWidget(bb);
+    d.resize(qMin(560, parent ? parent->width() : 560), 300);
+    list->setFocus();
+    if (d.exec() != QDialog::Accepted || !list->currentItem())
+        return QString();
+    return QDir(r36sSetupsDir()).filePath(list->currentItem()->data(Qt::UserRole).toString());
+}
+ 
+// Check a setup against this ECU, ask if something is missing, then write it into log_setup.txt.
+// Returns true when it was loaded (the caller applies it).
+static bool r36sLoadSetupFile(QWidget *parent, FileActions::LogValuesStructure *lv, const QString &protocol, const QString &path)
+{
+    R36SSetupFile s = r36sReadSetupFile(path);
+    QStringList display, logged, switches, warns, maths, mathNames, missing;
+    for (const QPair<QString, QString> &l : s.lines)
+        if (l.first == "math")
+        {
+            maths << l.second;
+            mathNames << l.second.section('|', 0, 0).trimmed().toLower();
+        }
+    int total = 0;
+    for (const QPair<QString, QString> &l : s.lines)
+    {
+        const QString &k = l.first, &v = l.second;
+        if (k == "display" || k == "log")
+        {
+            total++;
+            if (r36sFindValue(lv, protocol, v) < 0 && !mathNames.contains(v.toLower()))
+                missing << v;
+            (k == "display" ? display : logged) << v;
+        }
+        else if (k == "switch")
+        {
+            total++;
+            if (r36sFindSwitch(lv, protocol, v) < 0)
+                missing << v;
+            switches << v;
+        }
+        else if (k == "warn")
+            warns << v;
+    }
+    if (total == 0)
+    {
+        QMessageBox::information(parent, "Open log setup", QFileInfo(path).fileName() + " has no values in it.");
+        return false;
+    }
+    if (!missing.isEmpty())
+    {
+        QMessageBox box(parent);
+        box.setWindowTitle("Open log setup");
+        box.setText(QString("Found %1 of %2 values on this ECU.\nNot on this ECU (left out):\n  ")
+                    .arg(total - missing.length()).arg(total) + missing.mid(0, 8).join("\n  ") +
+                    (missing.length() > 8 ? QString("\n  ... and %1 more").arg(missing.length() - 8) : QString()));
+        QPushButton *load = box.addButton("Load anyway", QMessageBox::AcceptRole);
+        box.addButton(QMessageBox::Cancel);
+        box.setDefaultButton(load);
+        box.exec();
+        if (box.clickedButton() != load)
+            return false;
+    }
+    r36sSaveLogSetup(display, logged, switches, warns, maths);   // other lines in log_setup.txt (ports etc.) stay
+    r36sLastSetup = QFileInfo(path).fileName();
+    return true;
+}
+// ===== end R36S save / open log setups =====
+
+// ===== R36S: External tab - Arduino / wideband on USB, and the device on the Tactrix AUX =====
+// Writes the same log_setup.txt lines you can type by hand:
+//   arduino_port = auto | /dev/...   (Arduino on USB)     arduino_port = jack + jack_baud = 115200 (Arduino on AUX)
+//   aem = auto | /dev/...            (AEM on USB, PC)     aem = jack (AEM on AUX)
+//   lm2 = auto | /dev/...            (Innovate on USB, PC) lm2 = jack (Innovate on AUX)
+struct R36SExternal
+{
+    QString jack = "off";                        // Tactrix AUX: off | arduino | aem | lm2
+    QString usbDev = "off";                      // USB: off | arduino | aem | lm2
+    QString usbPort = "auto";                    // auto or a port such as /dev/ttyUSB0
+};
+ 
+static R36SExternal r36sReadExternal()
+{
+    R36SExternal e;
+    QString port, lm2, aem;
+    QFile f(QDir(R36S_FILES_DIR).filePath("log_setup.txt"));
+    if (f.open(QFile::ReadOnly | QFile::Text))
+    {
+        QTextStream in(&f);
+        while (!in.atEnd())
+        {
+            QString t = in.readLine().trimmed();
+            if (t.startsWith('#')) continue;
+            int eq = t.indexOf('=');
+            if (eq < 0) continue;
+            QString kind = t.left(eq).trimmed().toLower(), val = t.mid(eq + 1).trimmed();
+            if (kind == "arduino_port") port = val;
+            else if (kind == "lm2") lm2 = val;
+            else if (kind == "aem") aem = val;
+        }
+    }
+    // Tactrix AUX: same order r36sArduinoUpdate() checks them in
+    if (port.toLower() == "jack") e.jack = "arduino";
+    else if (lm2.toLower() == "jack") e.jack = "lm2";
+    else if (aem.toLower() == "jack") e.jack = "aem";
+    // USB: Arduino first, then AEM, then Innovate (one USB device in this tab)
+    if (!port.isEmpty() && port.toLower() != "jack") { e.usbDev = "arduino"; e.usbPort = port; }
+    else if (!aem.isEmpty() && aem.toLower() != "jack") { e.usbDev = "aem"; e.usbPort = aem; }
+    else if (!lm2.isEmpty() && lm2.toLower() != "jack") { e.usbDev = "lm2"; e.usbPort = lm2; }
+    return e;
+}
+ 
+static void r36sSaveExternal(const R36SExternal &e)
+{
+    QString path = QDir(R36S_FILES_DIR).filePath("log_setup.txt");
+    QStringList kept;
+    QFile in(path);
+    if (in.open(QFile::ReadOnly | QFile::Text))
+    {
+        QTextStream ts(&in);
+        while (!ts.atEnd())
+        {
+            QString line = ts.readLine();
+            QString t = line.trimmed();
+            int eq = t.indexOf('=');
+            QString kind = eq > 0 ? t.left(eq).trimmed().toLower() : QString();
+            if (t.startsWith("# External tab"))
+                continue;
+            if (!t.startsWith('#') && (kind == "arduino_port" || kind == "lm2" || kind == "aem" || kind == "jack_baud"))
+                continue;
+            kept.append(line);
+        }
+        in.close();
+    }
+    QStringList dev;
+    if (e.jack == "arduino") dev << "arduino_port = jack" << "jack_baud = 115200";
+    else if (e.jack == "lm2") dev << "lm2 = jack";
+    else if (e.jack == "aem") dev << "aem = jack";
+    QString port = e.usbPort.isEmpty() ? QString("auto") : e.usbPort;
+    if (e.usbDev != e.jack)                      // the same device can't be on both
+    {
+        if (e.usbDev == "arduino") dev << "arduino_port = " + port;
+        else if (e.usbDev == "aem") dev << "aem = " + port;
+        else if (e.usbDev == "lm2") dev << "lm2 = " + port;
+    }
+    // Device lines go above the value lines (display / log / ...), so the file stays easy to read
+    int at = kept.length();
+    for (int i = 0; i < kept.length(); i++)
+    {
+        QString t = kept.at(i).trimmed();
+        int eq = t.indexOf('=');
+        QString kind = eq > 0 ? t.left(eq).trimmed().toLower() : QString();
+        if (!t.startsWith('#') && (kind == "math" || kind == "display" || kind == "log" || kind == "switch" || kind == "warn"))
+        { at = i; break; }
+    }
+    QStringList block;
+    block << "# External tab (Logger Setup): device on USB / device on the Tactrix AUX (2.5 mm)";
+    block << dev;
+    if (at > 0 && !kept.at(at - 1).trimmed().isEmpty()) block.prepend("");
+    block << "";
+    for (int i = block.length() - 1; i >= 0; i--)
+        kept.insert(at, block.at(i));
+    for (int i = kept.length() - 1; i > 0; i--)   // no double blank lines after repeated saves
+        if (kept.at(i).trimmed().isEmpty() && kept.at(i - 1).trimmed().isEmpty())
+            kept.removeAt(i);
+    while (!kept.isEmpty() && kept.first().trimmed().isEmpty())
+        kept.removeFirst();
+    while (!kept.isEmpty() && kept.last().trimmed().isEmpty())
+        kept.removeLast();
+    QFile out(path);
+    if (!out.open(QFile::WriteOnly | QFile::Text))
+        return;
+    QTextStream os(&out);
+    for (const QString &l : kept) os << l << "\n";
+}
+// ===== end R36S External tab helpers =====
+
 // Window to pick the 6 boxes (with warning limits), extra CSV values, switches and simple
 // math channels. tab: 0 Display, 1 Log, 2 Switches, 3 Math.
 // Returns true when OK was pressed (log_setup.txt saved and applied).
@@ -1884,7 +2487,7 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
         return false;
     if (!QDir(R36S_FILES_DIR).exists())
     {
-        QMessageBox::information(parent, "Log values", "FastECU-Files is not available.\nStart FastECU with the R36S launcher or run-fastecu-pc.sh.");
+        QMessageBox::information(parent, "Logger Setup", "FastECU-Files is not available.\nStart FastECU with the R36S launcher or run-fastecu-pc.sh.");
         return false;
     }
 
@@ -1895,6 +2498,11 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
             !lv->log_value_address.at(j).isEmpty() && lv->log_value_ecu_byte_index.at(j) != "math" &&
             !names.contains(lv->log_value_name.at(j)) && !ardNames.contains(lv->log_value_name.at(j)))
         {
+                        // R36S: LM-2 / AEM values are only offered while that device is picked (Tactrix AUX or USB)
+            const QString &vid = lv->log_value_id.at(j);
+            if ((vid.startsWith("LM2_") && r36sJackMode != R36S_JACK_LM2 && r36sWbDevice != 2) ||
+                (vid.startsWith("AEM_") && r36sJackMode != R36S_JACK_AEM && r36sWbDevice != 1))
+                continue;
             if (lv->log_value_ecu_byte_index.at(j) == "ard")
                 ardNames.append(lv->log_value_name.at(j));
             else
@@ -1906,7 +2514,7 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
             switchNames.append(lv->log_switch_name.at(j));
     if (names.isEmpty())
     {
-        QMessageBox::information(parent, "Log values", "Connect to the ECU first, so FastECU knows which values it supports.");
+        QMessageBox::information(parent, "Logger Setup", "Connect to the ECU first, so FastECU knows which values it supports.");
         return false;
     }
     names.sort(Qt::CaseInsensitive);
@@ -1952,7 +2560,7 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
     }
 
     QDialog dlg(parent);
-    dlg.setWindowTitle("Log values");
+    dlg.setWindowTitle("Logger Setup");
       // R36S: never wider/taller than the screen (640 x 480 on the R36S)
     QScreen *scr = (parent && parent->screen()) ? parent->screen() : QGuiApplication::primaryScreen();
     QRect avail = scr->availableGeometry();
@@ -2112,6 +2720,86 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
     tabs->addTab(logList, "Log to CSV");
     tabs->addTab(switchList, "Switches");
     tabs->addTab(mathTab, "Math");
+        // ---- External: device on USB, and the device on the Tactrix AUX (2.5 mm) input ----
+    const R36SExternal extStart = r36sReadExternal();
+    QWidget *extTab = new QWidget;
+    QVBoxLayout *extLayout = new QVBoxLayout(extTab);
+    QFormLayout *extForm = new QFormLayout;
+    QComboBox *usbCombo = new QComboBox;         // device on USB
+    usbCombo->addItem("Off", "off");
+    usbCombo->addItem("Arduino Nano (CSV, 115200)", "arduino");
+    usbCombo->addItem("AEM UEGO (PC) (text, 9600)", "aem");
+    usbCombo->addItem("Innovate LM-2 / MTX (PC) (MTS, 19200)", "lm2");
+    usbCombo->setCurrentIndex(qMax(0, usbCombo->findData(extStart.usbDev)));
+    QComboBox *usbPortCombo = new QComboBox;     // which USB port
+    usbPortCombo->addItem("Auto (first USB serial)", "auto");
+    for (const QSerialPortInfo &pi : QSerialPortInfo::availablePorts())
+        if (usbPortCombo->findData(pi.systemLocation()) < 0)
+            usbPortCombo->addItem(pi.systemLocation() +
+                                  (pi.description().isEmpty() ? QString() : "  (" + pi.description() + ")"),
+                                  pi.systemLocation());
+    if (usbPortCombo->findData(extStart.usbPort) < 0)
+        usbPortCombo->addItem(extStart.usbPort, extStart.usbPort);   // set by hand, not plugged in now
+    usbPortCombo->setCurrentIndex(qMax(0, usbPortCombo->findData(extStart.usbPort)));
+    r36sNarrowCombo(usbPortCombo, 20);
+    QComboBox *jackCombo = new QComboBox;        // device on the Tactrix AUX
+    jackCombo->addItem("Off", "off");
+    jackCombo->addItem("Arduino Nano (CSV, 115200)", "arduino");
+    jackCombo->addItem("AEM UEGO X-Series (text, 9600)", "aem");
+    jackCombo->addItem("Innovate LM-2 / MTX (MTS, 19200)", "lm2");
+    jackCombo->setCurrentIndex(qMax(0, jackCombo->findData(extStart.jack)));
+    extForm->addRow("USB:", usbCombo);
+    extForm->addRow("USB port:", usbPortCombo);
+    extForm->addRow("Tactrix AUX (2.5 mm):", jackCombo);
+    extLayout->addLayout(extForm);
+    QLabel *extInfo = new QLabel;
+    extInfo->setWordWrap(true);
+    extLayout->addWidget(extInfo);
+    QPushButton *extApply = new QPushButton("Apply (adds the device's values to the lists)");
+    extLayout->addWidget(extApply);
+    QLabel *extNote = new QLabel("One device on each. (PC) = PC only: the R36S has no driver for USB serial adapters "
+                                 "(its Arduino on USB is read straight from the FTDI / CH340 chip). "
+                                 "If Logging is on, turn it off and on to switch devices.");
+    extNote->setWordWrap(true);
+    extLayout->addWidget(extNote);
+    extLayout->addStretch(1);
+    auto devText = [](const QString &d, bool aux) -> QString {
+        if (d == "arduino")
+            return aux ? "Arduino Nano CSV through the AUX module (Tactrix channel 9 at 115200). Values: the Nano's columns (Arduino)."
+                       : "Arduino Nano CSV on its USB cable or adapter at 115200. Values: the Nano's columns (Arduino).";
+        if (d == "aem")
+            return QString("AEM serial out at 9600, one value per line. ") +
+                   (aux ? "Ring = AEM blue, sleeve = AEM black ground, tip not used. Meter blue to ground first: "
+                          "negative or 0 V idle is OK, a steady +5 V is not. "
+                        : "Through an RS-232 serial-to-USB adapter. ") +
+                   "Set the gauge to lambda. Values: Wideband Lambda / AFR (AEM). Not yet tested.";
+        if (d == "lm2")
+            return QString("Innovate MTS at 19200") + (aux ? " (Innovate serial cable to the Tactrix AUX). "
+                                                           : " (Innovate serial cable through a serial-to-USB adapter). ") +
+                   "Values: Wideband Lambda / AFR / Status (LM-2). Status 0 = ok, 4 = warming up.";
+        return QString();
+    };
+    auto extUpdate = [jackCombo, usbCombo, usbPortCombo, extInfo, devText]() {
+        QString u = usbCombo->currentData().toString(), j = jackCombo->currentData().toString();
+        usbPortCombo->setEnabled(u != "off");
+        QStringList lines;
+        if (u != "off") lines << "USB: " + devText(u, false);
+        if (j != "off") lines << "Tactrix AUX: " + devText(j, true);
+        extInfo->setText(lines.isEmpty() ? QString("Nothing picked.") : lines.join("\n"));
+    };
+    // The same device can't be on USB and on the Tactrix AUX: picking it on one turns the other off
+    QObject::connect(usbCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, [usbCombo, jackCombo, extUpdate](int) {
+        if (usbCombo->currentData() != "off" && usbCombo->currentData() == jackCombo->currentData())
+            jackCombo->setCurrentIndex(0);
+        extUpdate();
+    });
+    QObject::connect(jackCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, [usbCombo, jackCombo, extUpdate](int) {
+        if (jackCombo->currentData() != "off" && jackCombo->currentData() == usbCombo->currentData())
+            usbCombo->setCurrentIndex(0);
+        extUpdate();
+    });
+    extUpdate();
+    tabs->addTab(extTab, "External");
 
     // R36S: values shown in the boxes are always logged, so on the Log to CSV tab they are
     // highlighted and locked (can't be unselected). Changing a box updates the list right away.
@@ -2173,7 +2861,7 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
         for (QComboBox *cb : { mathA.at(r), mathOp.at(r), mathB.at(r) })
             QObject::connect(cb, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, [refreshMath](int) { refreshMath(); });
 
-    tabs->setCurrentIndex(qBound(0, tab, 3));
+    tabs->setCurrentIndex(qBound(0, tab, 4));
 
     QLabel *note = new QLabel("Highlighted rows are logged. Light rows are shown in a box and always logged. "
                               "A box turns red past its warning limit. Fewer values = faster updates.");
@@ -2182,42 +2870,97 @@ bool r36sLogSetupDialog(QWidget *parent, FileActions::LogValuesStructure *lv, co
     QDialogButtonBox *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    // R36S: save what is in this window as a named setup, or open one (FastECU-Files/log_setups)
+    QPushButton *saveSetup = buttons->addButton("Save setup...", QDialogButtonBox::ActionRole);
+    QPushButton *openSetup = buttons->addButton("Open setup...", QDialogButtonBox::ActionRole);
     mainLayout->addWidget(buttons);
-
+ 
+    QStringList display, logged, switches, warns, maths;
+    // What the window shows now, as log_setup.txt lines (used by OK and by Save setup)
+    auto collect = [&]() {
+        display.clear(); logged.clear(); switches.clear(); warns.clear(); maths.clear();
+        for (int r = 0; r < R36S_MATH_ROWS; r++)
+            if (mathA.at(r)->currentIndex() > 0 && mathB.at(r)->currentIndex() > 0)
+            {
+                QString line = r36sMathSimpleLine(mathA.at(r)->currentText(), MATH_OPS[mathOp.at(r)->currentIndex()], mathB.at(r)->currentText());
+                if (!maths.contains(line)) maths << line;
+            }
+        for (const R36SMathChannel &m : formulas)
+            maths << (m.simple ? r36sMathSimpleLine(m.a, m.op, m.b)
+                               : m.name + " | " + m.formula + (m.unit.isEmpty() ? QString() : " | " + m.unit));
+        for (QComboBox *cb : boxes)
+            if (cb->currentIndex() > 0 && !display.contains(cb->currentText()))
+                display << cb->currentText();
+        for (int r = 0; r < logList->count(); r++)
+            if (logList->item(r)->isSelected() && !display.contains(logList->item(r)->text()))
+                logged << logList->item(r)->text();
+        for (int r = 0; r < switchList->count(); r++)
+            if (switchList->item(r)->isSelected())
+                switches << switchList->item(r)->text();
+        for (const QString &n : display)   // warnings are kept for values shown in a box
+        {
+            QHash<QString, R36SWarn>::const_iterator w = warnByName->constFind(n);
+            if (w != warnByName->constEnd())
+                warns << n + " " + QString(w.value().op) + " " + QString::number(w.value().limit, 'g', 10);
+        }
+    };
+    bool loadedSetup = false;
+        int reopenTab = -1;              // open the window again on this tab after applying
+    QObject::connect(extApply, &QPushButton::clicked, &dlg, [&]() {
+        reopenTab = tabs->currentIndex();
+        dlg.accept();
+    });
+    QObject::connect(saveSetup, &QPushButton::clicked, &dlg, [&]() {
+        collect();
+        if (display.isEmpty() && logged.isEmpty())
+        {
+            QMessageBox::information(&dlg, "Save log setup", "Nothing is selected to save.");
+            return;
+        }
+        QString path = r36sAskSetupName(&dlg, ecuid);
+        if (path.isEmpty())
+            return;
+        if (r36sWriteSetupFile(path, ecuid, display, logged, switches, warns, maths))
+        {
+            r36sLastSetup = QFileInfo(path).fileName();
+            QMessageBox::information(&dlg, "Save log setup", "Saved " + QFileInfo(path).fileName());
+        }
+        else
+            QMessageBox::warning(&dlg, "Save log setup", "Could not write " + path);
+    });
+    QObject::connect(openSetup, &QPushButton::clicked, &dlg, [&]() {
+        QString path = r36sAskSetupFile(&dlg, ecuid);
+        if (path.isEmpty())
+            return;
+        if (r36sLoadSetupFile(&dlg, lv, protocol, path))
+        {
+            loadedSetup = true;   // log_setup.txt now holds the opened setup
+            reopenTab = tabs->currentIndex();   // keep Logger Setup open, showing the opened setup
+            dlg.accept();
+        }
+    });
+ 
     if (dlg.exec() != QDialog::Accepted)
         return false;
-
-    QStringList display, logged, switches, warns, maths;
-    for (int r = 0; r < R36S_MATH_ROWS; r++)
-        if (mathA.at(r)->currentIndex() > 0 && mathB.at(r)->currentIndex() > 0)
-        {
-            QString line = r36sMathSimpleLine(mathA.at(r)->currentText(), MATH_OPS[mathOp.at(r)->currentIndex()], mathB.at(r)->currentText());
-            if (!maths.contains(line)) maths << line;
-        }
-    for (const R36SMathChannel &m : formulas)
-        maths << (m.simple ? r36sMathSimpleLine(m.a, m.op, m.b)
-                           : m.name + " | " + m.formula + (m.unit.isEmpty() ? QString() : " | " + m.unit));
-    for (QComboBox *cb : boxes)
-        if (cb->currentIndex() > 0 && !display.contains(cb->currentText()))
-            display << cb->currentText();
-    for (int r = 0; r < logList->count(); r++)
-        if (logList->item(r)->isSelected() && !display.contains(logList->item(r)->text()))
-            logged << logList->item(r)->text();
-    for (int r = 0; r < switchList->count(); r++)
-        if (switchList->item(r)->isSelected())
-            switches << switchList->item(r)->text();
-    for (const QString &n : display)   // warnings are kept for values shown in a box
+ 
+    if (!loadedSetup)
     {
-        QHash<QString, R36SWarn>::const_iterator w = warnByName->constFind(n);
-        if (w != warnByName->constEnd())
-            warns << n + " " + QString(w.value().op) + " " + QString::number(w.value().limit, 'g', 10);
+        collect();
+        r36sSaveLogSetup(display, logged, switches, warns, maths);
     }
-
-    r36sSaveLogSetup(display, logged, switches, warns, maths);
+    R36SExternal ext;
+    ext.jack = jackCombo->currentData().toString();
+    ext.usbDev = usbCombo->currentData().toString();
+    ext.usbPort = usbPortCombo->currentData().toString();
+    if (ext.jack != extStart.jack || ext.usbDev != extStart.usbDev || ext.usbPort != extStart.usbPort)
+        r36sSaveExternal(ext);
     r36sApplyLogSetup(lv, protocol, ecuid);
     r36sResetMinMax();
+    if (reopenTab >= 0)
+        r36sLogSetupDialog(parent, lv, protocol, ecuid, reopenTab);   // same window again, with the new lists
     return true;
 }
+
 // ===== end R36S choose values =====
 
 
@@ -2612,8 +3355,8 @@ void MainWindow::read_log_serial_data()
             //emit LOG_D("Log params get failed:" << parse_message_to_hex(received), true, true);
         }
 
-                if (logging_state)
-            r36sJackPoll(serial);   // R36S: 2.5 mm jack bytes came in with the same Tactrix read (only while logging)
+        if (logging_state)
+            r36sJackPoll(serial);   // R36S: Tactrix AUX bytes came in with the same Tactrix read (only while logging)
 
         logparams_read_active = false;
     }

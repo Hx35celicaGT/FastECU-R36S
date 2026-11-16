@@ -408,7 +408,12 @@ MainWindow::MainWindow(QString peerAddress, QString peerPassword, QWidget *paren
         connect(controls, &QAction::triggered, this, [this]() { r36sShowControls(this); });
     }
 
-
+    // R36S: View > Log views opens the Logger Setup window (6 boxes, Log to CSV, switches, math,
+    // external devices). Renamed here so the menu.cfg already on each card doesn't need editing.
+    for (QMenu *m : ui->menubar->findChildren<QMenu*>())
+        for (QAction *a : m->actions())
+            if (a->text().remove('&') == "Log views")
+                a->setText("Logger Setup...");
 
     connect(ui->calibrationDataTreeWidget, SIGNAL(itemExpanded(QTreeWidgetItem*)), this, SLOT(calibration_data_treewidget_item_expanded(QTreeWidgetItem*)));
     connect(ui->calibrationDataTreeWidget, SIGNAL(itemCollapsed(QTreeWidgetItem*)), this, SLOT(calibration_data_treewidget_item_collapsed(QTreeWidgetItem*)));
