@@ -262,7 +262,9 @@ void MainWindow::inc_dec_value(QString action)
                             if (action == "fine_dec")
                                 map_item_value -= map_fine_inc_value;
 
-                            if (map_min_value != " " && map_item_value < map_min_value.toFloat()) {
+                            // min only stops a decrease, max only stops an increase: a value already
+                            // outside the limits (or just above a max the ROM can't store exactly) can still move back
+                            if (map_min_value != " " && map_item_value < map_min_value.toFloat() && (action == "fine_dec" || action == "coarse_dec")) {
                                 map_item_value = map_min_value.toFloat();
                                 new_rom_data_value = QString::number(fileActions->calculate_value_from_expression(fileActions->parse_stringlist_from_expression_string(map_value_to_byte, QString::number(map_item_value))));
                                 map_data_value.dword_value = new_rom_data_value.toUInt();
@@ -272,7 +274,7 @@ void MainWindow::inc_dec_value(QString action)
                                     new_rom_data_value = QString::number(qRound(new_rom_data_value.toFloat()));
                                 break;
                             }
-                            if (map_max_value != " " && map_item_value > map_max_value.toFloat()) {
+                            if (map_max_value != " " && map_item_value > map_max_value.toFloat() && (action == "fine_inc" || action == "coarse_inc")) {
                                 map_item_value = map_max_value.toFloat();
                                 new_rom_data_value = QString::number(fileActions->calculate_value_from_expression(fileActions->parse_stringlist_from_expression_string(map_value_to_byte, QString::number(map_item_value))));
                                 map_data_value.dword_value = new_rom_data_value.toUInt();
@@ -1256,6 +1258,20 @@ void MainWindow::set_maptablewidget_items()
                 }
             }
             QStringList mapDataCellText = ecuCalDef[mapRomNumber]->MapData.at(mapNumber).split(",");
+
+            // colour range from the values as they are now (edits change it)
+            if (mapNumber < ecuCalDef[mapRomNumber]->MapCellColorMin.count() && mapNumber < ecuCalDef[mapRomNumber]->MapCellColorMax.count())
+            {
+                float lo = mapDataCellText.value(0).toFloat(), hi = lo;
+                for (int k = 0; k < mapSize && k < mapDataCellText.count(); k++)
+                {
+                    lo = qMin(lo, mapDataCellText.at(k).toFloat());
+                    hi = qMax(hi, mapDataCellText.at(k).toFloat());
+                }
+                ecuCalDef[mapRomNumber]->MapCellColorMin[mapNumber] = QString::number(lo);
+                ecuCalDef[mapRomNumber]->MapCellColorMax[mapNumber] = QString::number(hi);
+            }
+
             for (int i = 0; i < mapSize; i++)
             {
                 int yPos = 0;
